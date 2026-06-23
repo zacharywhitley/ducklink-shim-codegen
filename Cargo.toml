@@ -1,0 +1,19 @@
+[package]
+name = "ducklink-shim-codegen"
+version = "0.1.0"
+edition = "2021"
+description = "Generate a DuckDB extension that bridges DataFission wasm shims (PostGIS, MobilityDB) into DuckDB as native functions/aggregates/types/operators. Reads a shim-interface SQLite database via shim-bridge-codegen-core's BridgePlan."
+license = "Apache-2.0"
+
+[[bin]]
+name = "ducklink-shim-codegen"
+path = "src/main.rs"
+
+[lib]
+name = "ducklink_shim_codegen"
+path = "src/lib.rs"
+
+[dependencies]
+shim-bridge-codegen-core = { path = "../shim-bridge-codegen-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
