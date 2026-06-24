@@ -24,19 +24,15 @@ datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader
 datafission-df-plugin-api    = {{ path = "../datafission/crates/df-plugin-api" }}
 datafission-functions        = {{ path = "../datafission/crates/functions" }}
 
-# The duckdb crate ships the `vscalar` (vectorised scalar
-# function) trait + the `duckdb_entrypoint_c_api` macro that
-# expands to the C-ABI loadable-extension entry point. We pin
-# to the latest 1.x release.
-# Local fork of duckdb-rs that exposes Connection::handle()
-# (the raw `duckdb_connection` accessor we need to reach
-# aggregate / logical-type / cast registration APIs that the
-# upstream Rust binding doesn't surface). The same path-dep
-# pins duckdb-loadable-macros and libduckdb-sys to the
-# matching versions so feature-flagged FFI lines up.
-duckdb                  = {{ path = "../duckdb-rs/crates/duckdb", features = ["vscalar", "loadable-extension"] }}
-duckdb-loadable-macros  = {{ path = "../duckdb-rs/crates/duckdb-loadable-macros" }}
-libduckdb-sys           = {{ path = "../duckdb-rs/crates/libduckdb-sys", features = ["loadable-extension"] }}
+# Stock duckdb-rs from crates.io. We use it for the typed
+# `Connection` + `VScalar` trait (scalar dispatch). The
+# aggregate / custom-type registration paths go directly
+# through `libduckdb-sys` raw FFI — duckdb-rs doesn't surface
+# those APIs in its safe wrapper but the C ABI is fully
+# accessible via libduckdb-sys (a re-export of libduckdb-sys's
+# `loadable-extension` feature).
+duckdb         = {{ version = "~1.10504", features = ["vscalar", "loadable-extension"] }}
+libduckdb-sys  = {{ version = "~1.10504", features = ["loadable-extension"] }}
 
 anyhow      = "1"
 once_cell   = "1"
@@ -84,50 +80,106 @@ pub mod system_catalog;
 pub mod spatial_indexes;
 
 use std::error::Error;
+use std::ffi::CString;
 
-use duckdb::{{Connection, Result}};
-use duckdb_loadable_macros::duckdb_entrypoint_c_api;
+use duckdb::Connection;
+use libduckdb_sys as ffi;
 
-/// DuckDB extension entry point. The `duckdb_entrypoint_c_api`
-/// macro expands to the C-ABI `<name>_init_c_api` symbol that
-/// DuckDB's `LOAD` looks up. The macro also injects the
-/// version-compatibility check (we require DuckDB ≥ v0.0.1 —
-/// any version that supports the vscalar API).
+/// DuckDB extension entry point. We hand-roll the C-ABI symbol
+/// instead of using `#[duckdb_entrypoint_c_api]` so we can pull
+/// the raw `duckdb_connection` out for the parts of the surface
+/// (aggregates, custom types, casts) that duckdb-rs doesn't
+/// wrap. The macro builds a `Connection` from
+/// `duckdb_database` and discards everything else; we need the
+/// raw pointer.
 ///
 /// The composed shim wasm path comes from the
 /// `{env}` env var so the bridge isn't pinned to
 /// a build-time location (matches the host's runtime-loaded
 /// model).
-#[duckdb_entrypoint_c_api(ext_name = "{name}_duckdb_bridge", min_duckdb_version = "v1.2.0")]
-pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
-    // Phase 4b — register custom types first. Independent of the
-    // shim load: aliases-as-BLOB only need a duckdb_connection,
-    // not a working wasm component. Running this before the shim
-    // load means `CREATE TABLE t (g GEOMETRY)` still works even
-    // if shim loading fails (e.g. wasm not on disk yet).
-    types::register_all(&conn).map_err(|e| {{
-        format!("type registration: {{e}}")
-    }})?;
-    registry::load_shim().map_err(|e| {{
-        // Use the alternate `:#` formatter so anyhow walks the
-        // cause chain; without it, the inner wasm-loader error
-        // gets hidden behind whatever with_context wrapper is
-        // outermost.
-        format!("shim load: {{e:#}}")
-    }})?;
-    scalars::register_all(&conn).map_err(|e| {{
-        format!("scalar registration: {{e}}")
-    }})?;
-    // Phase 3c — aggregates currently a no-op (duckdb-rs has no
-    // aggregate API). Captures still happen in registry so a
-    // future flip-on is mechanical.
-    aggregates::register_all(&conn).map_err(|e| {{
-        format!("aggregate registration: {{e}}")
-    }})?;
-    table_functions::register_all(&conn).map_err(|e| {{
-        format!("table function registration: {{e}}")
-    }})?;
-    Ok(())
+///
+/// # Safety
+///
+/// Called by DuckDB on LOAD. `info` and `access` are valid for
+/// the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn {name}_duckdb_bridge_init_c_api(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> bool {{
+    match entrypoint_inner(info, access) {{
+        Ok(v)  => v,
+        Err(e) => {{
+            if let Some(set_error_fn) = (*access).set_error {{
+                if let Ok(cs) = CString::new(e.to_string()) {{
+                    set_error_fn(info, cs.as_ptr());
+                }}
+            }}
+            false
+        }}
+    }}
+}}
+
+unsafe fn entrypoint_inner(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> Result<bool, Box<dyn Error>> {{
+    // Step 1 — install function-pointer trampolines for the C
+    // API version we built against (or refuse to load if the
+    // running DuckDB is older).
+    let have_api = ffi::duckdb_rs_extension_api_init(info, access, "v1.2.0")
+        .map_err(|e| -> Box<dyn Error> {{ e.into() }})?;
+    if !have_api {{
+        return Ok(false);
+    }}
+
+    // Step 2 — get the database handle DuckDB just opened.
+    let get_database = (*access).get_database
+        .ok_or("get_database function pointer is null in duckdb_extension_access")?;
+    let db_ptr = get_database(info);
+    if db_ptr.is_null() {{
+        return Ok(false);
+    }}
+    let db: ffi::duckdb_database = *db_ptr;
+
+    // Step 3 — open a raw connection. We use this connection for
+    // every registration call so types/aggregates/scalars all
+    // land in the same catalog session. Leaked deliberately:
+    // disconnecting here would invalidate registrations that
+    // DuckDB holds by reference to this connection.
+    let mut raw_con: ffi::duckdb_connection = std::ptr::null_mut();
+    if ffi::duckdb_connect(db, &mut raw_con) != ffi::DuckDBSuccess {{
+        return Err("duckdb_connect failed".into());
+    }}
+
+    // Step 4 — register custom types first (independent of the
+    // shim; aliases-as-BLOB only need a duckdb_connection).
+    // `CREATE TABLE t (g GEOMETRY)` works even if the shim
+    // failed to load.
+    types::register_all(raw_con);
+
+    // Step 5 — load the wasm shim.
+    registry::load_shim()
+        .map_err(|e| -> Box<dyn Error> {{ format!("shim load: {{e:#}}").into() }})?;
+
+    // Step 6 — scalars route through duckdb-rs's `VScalar`
+    // trait, which needs a `Connection`. Wrap the raw connection
+    // we already opened. Connection::open_from_raw opens
+    // another connection internally; we accept that — both go
+    // to the same database, registrations are catalog-scoped.
+    let conn = Connection::open_from_raw(db.cast())
+        .map_err(|e| -> Box<dyn Error> {{ format!("open_from_raw: {{e}}").into() }})?;
+    scalars::register_all(&conn)
+        .map_err(|e| -> Box<dyn Error> {{ format!("scalar registration: {{e}}").into() }})?;
+
+    // Step 7 — aggregates via raw libduckdb-sys.
+    aggregates::register_all(raw_con);
+
+    // Step 8 — UDTFs still go through duckdb-rs (vtab trait).
+    table_functions::register_all(&conn)
+        .map_err(|e| -> Box<dyn Error> {{ format!("table function registration: {{e}}").into() }})?;
+
+    Ok(true)
 }}
 "##,
         name = crate_name,
@@ -1624,17 +1676,14 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
 
-use duckdb::core::{Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::types::DuckString;
-use duckdb::{Connection, Result};
 use libduckdb_sys::{
-    duckdb_aggregate_function, duckdb_aggregate_function_add_parameter,
+    self as ffi, DuckDBSuccess, duckdb_aggregate_function_add_parameter,
     duckdb_aggregate_function_get_extra_info, duckdb_aggregate_function_set_error,
     duckdb_aggregate_function_set_extra_info, duckdb_aggregate_function_set_functions,
     duckdb_aggregate_function_set_name, duckdb_aggregate_function_set_return_type,
-    duckdb_aggregate_state, duckdb_create_aggregate_function, duckdb_data_chunk,
-    duckdb_destroy_aggregate_function, duckdb_function_info, duckdb_register_aggregate_function,
-    duckdb_string_t, duckdb_vector, idx_t,
+    duckdb_aggregate_state, duckdb_connection, duckdb_create_aggregate_function,
+    duckdb_data_chunk, duckdb_destroy_aggregate_function, duckdb_function_info,
+    duckdb_register_aggregate_function, duckdb_string_t, duckdb_vector, idx_t,
 };
 
 use datafission_functions::traits::{Accumulator, AggregateFunctionDef};
@@ -1650,7 +1699,12 @@ struct AggExtraInfo {
 }
 
 /// Register every aggregate the shim publishes.
-pub fn register_all(conn: &Connection) -> Result<()> {
+///
+/// # Safety
+///
+/// `conn` must be a valid `duckdb_connection` for the duration
+/// of this call.
+pub unsafe fn register_all(conn: duckdb_connection) {
 "##,
     );
 
@@ -1659,12 +1713,12 @@ pub fn register_all(conn: &Connection) -> Result<()> {
     for ext in &plan.extensions {
         for agg in &ext.aggregates {
             s.push_str(&format!(
-                "    register_aggregate(conn, \"{name}\")?;\n",
+                "    register_aggregate(conn, \"{name}\");\n",
                 name = agg.canonical_name,
             ));
             for alias in &agg.aliases {
                 s.push_str(&format!(
-                    "    register_aggregate(conn, \"{alias}\")?; // alias of {name}\n",
+                    "    register_aggregate(conn, \"{alias}\"); // alias of {name}\n",
                     alias = alias, name = agg.canonical_name,
                 ));
                 alias_count += 1;
@@ -1680,33 +1734,41 @@ pub fn register_all(conn: &Connection) -> Result<()> {
     }
 
     s.push_str(
-r##"    Ok(())
-}
+r##"}
 
-fn register_aggregate(conn: &Connection, sql_name: &str) -> Result<()> {
-    let def = registry::lookup_aggregate(sql_name).ok_or_else(|| {
-        duckdb_sys_error(format!("aggregate `{sql_name}` not registered by the shim"))
-    })?;
+unsafe fn register_aggregate(conn: duckdb_connection, sql_name: &str) {
+    let def = match registry::lookup_aggregate(sql_name) {
+        Some(d) => d,
+        None => {
+            eprintln!("[shim-aggregates] no shim entry for `{sql_name}` — skipping");
+            return;
+        }
+    };
 
-    unsafe {
-        let agg = duckdb_create_aggregate_function();
-        let name_cs = CString::new(sql_name).map_err(|e| duckdb_sys_error(format!("{e}")))?;
-        duckdb_aggregate_function_set_name(agg, name_cs.as_ptr());
+    let agg = duckdb_create_aggregate_function();
+    let name_cs = match CString::new(sql_name) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[shim-aggregates] name contains NUL: `{sql_name}` — skipping");
+            duckdb_destroy_aggregate_function(&mut { agg });
+            return;
+        }
+    };
+    duckdb_aggregate_function_set_name(agg, name_cs.as_ptr());
 
-        // PostGIS aggregates are unary (ST_Union, ST_Extent,
-        // ST_Collect — all take one geometry blob). For multi-
-        // arg future aggregates, walk def.param_types() and
-        // call add_parameter per type. Today's flat BLOB
-        // signature is shape-correct for every shim aggregate
-        // observed in the postgis surface.
-        let blob = LogicalTypeHandle::from(LogicalTypeId::Blob);
-        // Borrow the raw duckdb_logical_type out of the handle
-        // for the FFI call. The handle keeps the type alive for
-        // the duration of this scope; DuckDB clones the type
-        // internally when add_parameter consumes it.
-        duckdb_aggregate_function_add_parameter(agg, *(&blob as *const _ as *const _));
-        let ret = LogicalTypeHandle::from(LogicalTypeId::Blob);
-        duckdb_aggregate_function_set_return_type(agg, *(&ret as *const _ as *const _));
+    // PostGIS aggregates are unary (ST_Union, ST_Extent,
+    // ST_Collect — all take one geometry blob). For multi-arg
+    // future aggregates, walk def.param_types() and call
+    // add_parameter per type. Today's flat BLOB signature is
+    // shape-correct for every shim aggregate observed.
+    let blob = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_add_parameter(agg, blob);
+    duckdb_aggregate_function_set_return_type(agg, blob);
+    // Both add_parameter and set_return_type take the type by
+    // value and DuckDB clones it internally, so we still own
+    // `blob` and have to destroy it after use.
+    let mut blob_to_destroy = blob;
+    ffi::duckdb_destroy_logical_type(&mut blob_to_destroy);
 
         // Wire the callbacks (state_size + state_init + update +
         // combine + finalize). state_destroy goes through the
@@ -1719,41 +1781,33 @@ fn register_aggregate(conn: &Connection, sql_name: &str) -> Result<()> {
             Some(combine_callback),
             Some(finalize_callback),
         );
-        libduckdb_sys::duckdb_aggregate_function_set_destructor(agg, Some(state_destroy));
+    ffi::duckdb_aggregate_function_set_destructor(agg, Some(state_destroy));
 
-        // Park the per-registration state. The Box is leaked
-        // here and reclaimed when DuckDB calls the destructor.
-        let extra = Box::into_raw(Box::new(AggExtraInfo { def: Arc::clone(&def) }));
-        duckdb_aggregate_function_set_extra_info(
-            agg,
-            extra as *mut c_void,
-            Some(drop_extra_info),
+    // Park the per-registration state. The Box is leaked here
+    // and reclaimed when DuckDB calls the destructor.
+    let extra = Box::into_raw(Box::new(AggExtraInfo { def: Arc::clone(&def) }));
+    duckdb_aggregate_function_set_extra_info(
+        agg,
+        extra as *mut c_void,
+        Some(drop_extra_info),
+    );
+
+    let rc = duckdb_register_aggregate_function(conn, agg);
+    duckdb_destroy_aggregate_function(&mut { agg });
+    if rc != DuckDBSuccess {
+        // 5 PostGIS aggregate names clash with scalar variants
+        // (st_collect, st_union, st_clusterwithin,
+        // st_clusterdbscan, st_clusterintersecting). DuckDB
+        // rejects the registration in that case. Swallow the
+        // error so the non-clashing aggregates still register —
+        // the clashing ones fall back to the already-registered
+        // scalar form, which has the semantics the user probably
+        // wanted anyway.
+        eprintln!(
+            "postgis-duckdb-bridge: skipping aggregate `{sql_name}` \
+             (name already in use by a scalar; rc={rc})"
         );
-
-        let rc = duckdb_register_aggregate_function(conn.handle(), agg);
-        duckdb_destroy_aggregate_function(&mut { agg });
-        if rc != libduckdb_sys::DuckDBSuccess {
-            // 5 PostGIS aggregate names clash with scalar
-            // variants (st_collect, st_union, st_clusterwithin,
-            // st_clusterdbscan, st_clusterintersecting). DuckDB
-            // rejects the registration in that case. Swallow
-            // the error so the non-clashing aggregates still
-            // register — the clashing ones fall back to the
-            // already-registered scalar form, which has the
-            // semantics the user probably wanted anyway (the
-            // postgis aggregate variants are mostly partition-
-            // ed wrappers around the same kernel).
-            eprintln!(
-                "postgis-duckdb-bridge: skipping aggregate `{sql_name}` \
-                 (name already in use by a scalar; rc={rc})"
-            );
-        }
     }
-    Ok(())
-}
-
-fn duckdb_sys_error(msg: String) -> duckdb::Error {
-    duckdb::Error::ToSqlConversionFailure(msg.into())
 }
 
 // =====================================================================
@@ -1813,25 +1867,38 @@ unsafe fn update_inner(
     input: duckdb_data_chunk,
     states: *mut duckdb_aggregate_state,
 ) -> std::result::Result<(), String> {
-    let chunk = duckdb::core::DataChunkHandle::new_unowned(input);
-    let n = chunk.len();
-    let v0 = chunk.flat_vector(0);
-    let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
+    let n = ffi::duckdb_data_chunk_get_size(input) as usize;
+    let v0 = ffi::duckdb_data_chunk_get_vector(input, 0);
+    let data = ffi::duckdb_vector_get_data(v0) as *const duckdb_string_t;
+    let validity = ffi::duckdb_vector_get_validity(v0);
 
     for i in 0..n {
-        if v0.row_is_null(i as u64) {
+        if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as idx_t) {
             // SQL aggregates skip NULLs unless they're COUNT(*) —
             // PostGIS aggregates all skip NULL.
             continue;
         }
-        let mut s_raw = raw[i];
-        let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
+        let mut s_raw: duckdb_string_t = std::ptr::read(data.add(i));
+        let bytes = read_string_t_bytes(&mut s_raw);
         let acc_ptr = read_state(states, i);
         let acc = &mut *acc_ptr;
         acc.accumulate(&FunctionValue::Binary(bytes))
             .map_err(|e| format!("{e:?}"))?;
     }
     Ok(())
+}
+
+/// Decode a `duckdb_string_t` (DuckDB's inline-or-pointer
+/// string struct) into an owned `Vec<u8>`. Works for both
+/// inlined (≤12 bytes) and pointer-backed strings; the C API
+/// hides the discriminant for us.
+unsafe fn read_string_t_bytes(s: &mut duckdb_string_t) -> Vec<u8> {
+    let len = ffi::duckdb_string_t_length(*s) as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    let p = ffi::duckdb_string_t_data(s as *mut duckdb_string_t);
+    std::slice::from_raw_parts(p as *const u8, len).to_vec()
 }
 
 unsafe extern "C" fn combine_callback(
@@ -1879,25 +1946,19 @@ unsafe fn finalize_inner(
     count: idx_t,
     offset: idx_t,
 ) -> std::result::Result<(), String> {
-    // The result vector here is the OUTPUT vector for the
-    // aggregate. We need to write `count` results starting at
-    // `offset`. Wrap it in a FlatVector so we can call insert().
-    use duckdb::core::FlatVector;
-    let mut out: FlatVector = FlatVector::from_raw(result);
-
     for i in 0..count as usize {
+        let dst = offset as usize + i;
         let acc_ptr = read_state(source, i);
         if acc_ptr.is_null() {
-            out.set_null(offset as usize + i);
+            vector_set_null(result, dst);
             continue;
         }
         let acc = &**acc_ptr;
         let value = acc.finalize().map_err(|e| format!("{e:?}"))?;
-        let dst = offset as usize + i;
         match value {
-            FunctionValue::Binary(b) => out.insert(dst, b.as_slice()),
-            FunctionValue::String(s) => out.insert(dst, s.as_bytes()),
-            FunctionValue::Null => out.set_null(dst),
+            FunctionValue::Binary(b) => vector_assign_bytes(result, dst, &b),
+            FunctionValue::String(s) => vector_assign_bytes(result, dst, s.as_bytes()),
+            FunctionValue::Null => vector_set_null(result, dst),
             other => return Err(format!(
                 "aggregate finalize: unexpected result variant `{}`",
                 other.type_name()
@@ -1905,6 +1966,27 @@ unsafe fn finalize_inner(
         }
     }
     Ok(())
+}
+
+/// Write `bytes` into the `dst`-th slot of `result` (a BLOB or
+/// VARCHAR output vector). DuckDB copies the bytes internally,
+/// so the caller's `bytes` can be dropped after this call.
+unsafe fn vector_assign_bytes(result: duckdb_vector, dst: usize, bytes: &[u8]) {
+    ffi::duckdb_vector_assign_string_element_len(
+        result,
+        dst as idx_t,
+        bytes.as_ptr() as *const c_char,
+        bytes.len() as idx_t,
+    );
+}
+
+/// Mark the `dst`-th slot of `result` as SQL NULL.
+unsafe fn vector_set_null(result: duckdb_vector, dst: usize) {
+    ffi::duckdb_vector_ensure_validity_writable(result);
+    let validity = ffi::duckdb_vector_get_validity(result);
+    if !validity.is_null() {
+        ffi::duckdb_validity_set_row_invalid(validity, dst as idx_t);
+    }
 }
 
 unsafe extern "C" fn drop_extra_info(ptr: *mut c_void) {
@@ -2057,16 +2139,19 @@ r##"//! Custom column types — alias BLOB as GEOMETRY, GEOGRAPHY, …
 //! to match the policy aggregates_rs uses for scalar/aggregate
 //! collisions.
 
-use duckdb::{Connection, Result};
 use libduckdb_sys as ffi;
 use std::ffi::CString;
 
-pub fn register_all(conn: &Connection) -> Result<()> {
-    let con = conn.handle();
+/// Register every shim-published custom type as a BLOB alias.
+///
+/// # Safety
+///
+/// `con` must be a valid `duckdb_connection` for the duration
+/// of this call.
+pub unsafe fn register_all(con: ffi::duckdb_connection) {
     if con.is_null() {
-        return Ok(());
+        return;
     }
-    unsafe {
 "##,
     );
     let mut names: Vec<String> = Vec::new();
@@ -2081,12 +2166,10 @@ pub fn register_all(conn: &Connection) -> Result<()> {
     names.sort();
     names.dedup();
     for n in &names {
-        s.push_str(&format!("        register_type(con, {:?});\n", n));
+        s.push_str(&format!("    register_type(con, {:?});\n", n));
     }
     s.push_str(
-r##"    }
-    Ok(())
-}
+r##"}
 
 unsafe fn register_type(con: ffi::duckdb_connection, name: &str) {
     let handle = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
