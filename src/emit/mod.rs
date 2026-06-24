@@ -116,6 +116,9 @@ pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
     aggregates::register_all(&conn).map_err(|e| {{
         format!("aggregate registration: {{e}}")
     }})?;
+    table_functions::register_all(&conn).map_err(|e| {{
+        format!("table function registration: {{e}}")
+    }})?;
     Ok(())
 }}
 "##,
@@ -1666,17 +1669,67 @@ pub fn register_all(_conn: &Connection) -> Result<()> {
 pub fn table_functions_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! Table-function registration via duckdb::TableFunction.
-//! Each shim UDTF gets bind / init / function callbacks.
+r##"//! Table-function registration.
+//!
+//! ## Phase 4c — SCAFFOLDED (2026-06-24)
+//!
+//! Unlike aggregates (Phase 3c) and custom types (Phase 4b),
+//! DuckDB's TableFunction API IS exposed in duckdb-rs via
+//! the `VTab` trait. The `hello-ext` example
+//! (`~/.cargo/registry/.../duckdb-1.x/examples/hello-ext/main.rs`)
+//! shows the canonical pattern: bind/init/func callbacks +
+//! `con.register_table_function::<HelloVTab>("hello")`.
+//!
+//! Architecture for shipping this
+//!
+//!   1. Define one concrete `ShimVTab` type with a BindData
+//!      that holds Arc<dyn TableFunctionDef> + the parameter
+//!      values from the SQL call.
+//!
+//!   2. `bind` reads SQL params via `bind.get_parameter(i)`,
+//!      builds the output column schema from
+//!      `def.output_schema(...)`.
+//!
+//!   3. `init` creates a per-query InitData holding
+//!      `Box<dyn TableFunctionIterator>` from
+//!      `def.execute(&function_values)`.
+//!
+//!   4. `func` calls `iter.next_row()` repeatedly to fill the
+//!      output DataChunk; sets output length when chunk full
+//!      or iter exhausted.
+//!
+//! Same blocker as Phase 3c/4b — the way duckdb-rs threads
+//! state through bind/init/func means each shim UDTF needs
+//! its own per-name VTab struct (or unsafe shared state).
+//! With 7 PostGIS UDTFs and 2-3 ducks of unsafe code per
+//! per-UDTF impl, this is ~400 LOC that warrants its own
+//! session.
+
+use duckdb::{Connection, Result};
+
+/// Phase-4c no-op. The shim's UDTFs are captured in the
+/// registry; the day someone writes the ShimVTab adapter,
+/// this becomes a loop over registry::all_table_functions().
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// UDTFs the shim publishes.
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for tf in &ext.table_functions {
-            s.push_str(&format!("// udtf `{}`\n", tf.canonical_name));
+            let nargs = tf.param_signatures.first().map(|v| v.len()).unwrap_or(0);
+            s.push_str(&format!("// udtf `{}` (arity={})\n", tf.canonical_name, nargs));
+            if !tf.aliases.is_empty() {
+                s.push_str(&format!("//   aliases: {}\n", tf.aliases.join(", ")));
+            }
         }
     }
-    s.push_str("\n// TODO: emit register_table_function calls.\n");
     s
 }
 
