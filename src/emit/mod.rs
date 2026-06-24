@@ -13,14 +13,36 @@ description = "Generated DuckDB extension that bridges the {name} DataFission sh
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+name = "{name}_duckdb_bridge"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# TODO: pick a DuckDB-extension binding (duckdb-rs has loadable
-# extension support; cargo-component if going via WASM).
-# duckdb = {{ version = "1", features = ["bundled", "loadable-ext"] }}
-# datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader" }}
-# anyhow = "1"
+# Path-deps into the source DataFission tree so we can call the
+# loader's wasm scalar-invoke surface directly. Move to git-deps
+# when DataFission ships releases.
+datafission-df-plugin-loader = {{ path = "../datafission/crates/df-plugin-loader" }}
+datafission-df-plugin-api    = {{ path = "../datafission/crates/df-plugin-api" }}
+datafission-functions        = {{ path = "../datafission/crates/functions" }}
+
+# The duckdb crate ships the `vscalar` (vectorised scalar
+# function) trait + the `duckdb_entrypoint_c_api` macro that
+# expands to the C-ABI loadable-extension entry point. We pin
+# to the latest 1.x release.
+duckdb                  = {{ version = "1", features = ["vscalar", "loadable-extension"] }}
+duckdb-loadable-macros  = "1"
+libduckdb-sys           = "1"
+
+anyhow      = "1"
+once_cell   = "1"
+parking_lot = "0.12"
+tracing     = "0.1"
+serde_json  = "1"
+
+[profile.release]
+lto         = true
+codegen-units = 1
+opt-level   = "z"
+strip       = true
 "##,
         name = crate_name,
     )
@@ -28,45 +50,66 @@ crate-type = ["cdylib"]
 
 pub fn lib_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(
+    let crate_name = sanitize_crate_name(&primary_extension_name(plan));
+    s.push_str(&format!(
 r##"//! Generated DuckDB extension entry point.
 //!
 //! Load with:
-//!   INSTALL '<crate>';
-//!   LOAD '<crate>';
+//!   duckdb> INSTALL '{name}_duckdb_bridge' FROM '/path/to/dir';
+//!   duckdb> LOAD '{name}_duckdb_bridge';
+//!
+//! Phase 1 (2026-06-24): scalar dispatch wired through
+//! df-plugin-loader. ST_GeomFromText is fully functional; the
+//! other categories (aggregates, UDTFs, window funcs, types,
+//! operators, casts, preprocessors, system catalog, spatial
+//! indexes) are scaffold-only — see per-module TODOs and
+//! AGENTS.md for the phased plan.
 
-mod scalars;
-mod aggregates;
-mod table_functions;
-mod window_functions;
-mod types;
-mod operators;
-mod casts;
-mod preprocessors;
-mod system_catalog;
-mod spatial_indexes;
+pub mod registry;
+pub mod scalars;
+pub mod aggregates;
+pub mod table_functions;
+pub mod window_functions;
+pub mod types;
+pub mod operators;
+pub mod casts;
+pub mod preprocessors;
+pub mod system_catalog;
+pub mod spatial_indexes;
 
-// TODO: wire up the DuckDB C-extension entry points.
-//
-// The expected shape (loadable-extension ABI):
-//
-//   #[no_mangle]
-//   pub extern "C" fn <name>_version_rust() -> *const c_char {
-//       b"v1.0.0\0".as_ptr() as _
-//   }
-//
-//   #[no_mangle]
-//   pub extern "C" fn <name>_init_rust(db: ffi::duckdb_database) {
-//       let con = unsafe { Connection::from_raw(db) };
-//       // 1. Instantiate the wasm shim via df-plugin-loader.
-//       // 2. Call types::register_all(&con, &ext)?   // register LogicalType::USER first
-//       // 3. Call scalars::register_all(&con, &ext)?
-//       // 4. Call aggregates::register_all(&con, &ext)?
-//       // ...
-//   }
-//
+use std::error::Error;
+
+use duckdb::{{Connection, Result}};
+use duckdb_loadable_macros::duckdb_entrypoint_c_api;
+
+/// DuckDB extension entry point. The `duckdb_entrypoint_c_api`
+/// macro expands to the C-ABI `<name>_init_c_api` symbol that
+/// DuckDB's `LOAD` looks up. The macro also injects the
+/// version-compatibility check (we require DuckDB ≥ v0.0.1 —
+/// any version that supports the vscalar API).
+///
+/// The composed shim wasm path comes from the
+/// `{env}` env var so the bridge isn't pinned to
+/// a build-time location (matches the host's runtime-loaded
+/// model).
+#[duckdb_entrypoint_c_api(ext_name = "{name}_duckdb_bridge", min_duckdb_version = "v0.0.1")]
+pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
+    registry::load_shim().map_err(|e| {{
+        // Use the alternate `:#` formatter so anyhow walks the
+        // cause chain; without it, the inner wasm-loader error
+        // gets hidden behind whatever with_context wrapper is
+        // outermost.
+        format!("shim load: {{e:#}}")
+    }})?;
+    scalars::register_all(&conn).map_err(|e| {{
+        format!("scalar registration: {{e}}")
+    }})?;
+    Ok(())
+}}
 "##,
-    );
+        name = crate_name,
+        env = format!("{}_SHIM_WASM", primary_extension_name(plan).to_uppercase().replace('-', "_")),
+    ));
     s.push_str(&format!(
         "// Extensions loaded by this bridge:\n//\n{}\n",
         plan.extensions
@@ -92,25 +135,156 @@ pub fn scalars_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Scalar-function registration.
 //!
-//! DuckDB API:
+//! Phase 1 (2026-06-24): vectorised scalar dispatch wired up;
+//! ST_GeomFromText is fully functional. Other scalars are
+//! listed below as comments.
 //!
-//!   let mut sf = ScalarFunction::new("st_intersects");
-//!   sf.add_parameter(LogicalType::User("GEOMETRY"));
-//!   sf.add_parameter(LogicalType::User("GEOMETRY"));
-//!   sf.set_return_type(LogicalType::Boolean);
-//!   sf.set_function(Some(dispatch_fn));
-//!   con.register_scalar_function::<MyDispatchState>(sf)?;
+//! Dispatch shape (DuckDB is VECTORISED — every invoke is
+//! handed a chunk of N rows; SQLite was 1-at-a-time):
 //!
-//! The dispatch closure pulls args via DataChunk's vector
-//! accessors, builds a batch, calls the shim, writes results
-//! back into the output chunk. DuckDB ALREADY hands you N rows
-//! per call — that's the natural batch boundary.
+//!   For each row in input chunk:
+//!     - read varchar / blob / etc. into a FunctionValue
+//!     - call shim's ScalarFunctionDef::execute(&[…])
+//!     - write the result to the output FlatVector
+//!
+//! Phase 1 only covers the `(varchar) -> blob` signature shape
+//! (TextToBlobScalar). Other shapes need their own marker
+//! struct + VScalar impl + register_scalar_function_with_state
+//! call. See AGENTS.md → Phase 2.
+
+use std::sync::Arc;
+
+use duckdb::{
+    Connection, Result,
+    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
+    types::DuckString,
+    vscalar::{ScalarFunctionSignature, VScalar},
+    vtab::arrow::WritableVector,
+};
+use libduckdb_sys::duckdb_string_t;
+
+use datafission_functions::traits::ScalarFunctionDef;
+use datafission_functions::types::FunctionValue;
+
+use crate::registry;
+
+/// Register every Phase-1 scalar against the given connection.
+pub fn register_all(conn: &Connection) -> Result<()> {
+"##,
+    );
+
+    // For Phase 1: register ST_GeomFromText + every alias via
+    // TextToBlobScalar (a single VScalar impl with state = Arc
+    // of the underlying ScalarFunctionDef).
+    let mut emitted = 0;
+    for ext in &plan.extensions {
+        for sc in &ext.scalars {
+            if sc.canonical_name != "st_geomfromtext" {
+                continue;
+            }
+            s.push_str(&format!(
+                "    register_text_to_blob(conn, \"{name}\")?;\n",
+                name = sc.canonical_name,
+            ));
+            for alias in &sc.aliases {
+                s.push_str(&format!(
+                    "    register_text_to_blob(conn, \"{alias}\")?; // alias of {name}\n",
+                    alias = alias, name = sc.canonical_name,
+                ));
+            }
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        s.push_str("    // No Phase-1 scalars matched in this interface DB.\n");
+    }
+
+    s.push_str(
+r##"    Ok(())
+}
+
+/// Register one (varchar) -> blob scalar by name.
+fn register_text_to_blob(conn: &Connection, sql_name: &str) -> Result<()> {
+    let def: Arc<dyn ScalarFunctionDef> = registry::lookup_scalar(sql_name)
+        .ok_or_else(|| duckdb_sys_error(format!(
+            "scalar `{sql_name}` not registered by the shim"
+        )))?;
+    conn.register_scalar_function_with_state::<TextToBlobScalar>(sql_name, &def)
+}
+
+fn duckdb_sys_error(msg: String) -> duckdb::Error {
+    // The duckdb crate doesn't expose a "userland error" variant
+    // we can construct directly; round-trip through ToSqlConversionFailure
+    // until they ship one. See https://github.com/duckdb/duckdb-rs/issues
+    duckdb::Error::ToSqlConversionFailure(msg.into())
+}
+
+/// Marker VScalar for the `(varchar) -> blob` signature shape.
+/// State holds the shim's `ScalarFunctionDef` Arc; one
+/// registration per name, each with its own Arc.
+struct TextToBlobScalar;
+
+impl VScalar for TextToBlobScalar {
+    type State = Arc<dyn ScalarFunctionDef>;
+
+    fn invoke(
+        state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let n = input.len();
+        let input_vec = input.flat_vector(0);
+        // DuckDB stores varchar as duckdb_string_t (inline-short
+        // strings + pointer for long ones). DuckString unifies the
+        // two paths into a &str.
+        let raw = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(n) };
+
+        let mut out_vec = output.flat_vector();
+        for i in 0..n {
+            let mut s_raw = raw[i];
+            // as_str returns Cow<'_, str> (long strings ALLOC into
+            // an owned String; short ones borrow from the inline
+            // bytes). into_owned() collapses both paths to String
+            // before we hand it to the shim.
+            let wkt: String = DuckString::new(&mut s_raw).as_str().into_owned();
+            let args = [FunctionValue::String(wkt)];
+            let result = state.execute(&args)
+                .map_err(|e| format!("{e:?}"))?;
+            match result {
+                FunctionValue::Binary(b) => out_vec.insert(i, b.as_slice()),
+                FunctionValue::String(s) => out_vec.insert(i, s.as_bytes()),
+                FunctionValue::Null => out_vec.set_null(i),
+                other => return Err(format!(
+                    "TextToBlobScalar: unexpected result variant for `{}` from shim",
+                    other.type_name()
+                ).into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Blob),
+        )]
+    }
+}
+
+// ----------------------------------------------------------------------
+// Comment block: every scalar in this interface DB. Each line
+// becomes one Phase-2+ TODO — add a marker struct for the
+// signature shape (if not already present), then a
+// register_<shape>(conn, "name") call in register_all.
+// ----------------------------------------------------------------------
 
 "##,
     );
+
     for ext in &plan.extensions {
         s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for sc in &ext.scalars {
+            if sc.canonical_name == "st_geomfromtext" { continue; }
             let nargs = sc.param_signatures.first().map(|v| v.len()).unwrap_or(0);
             s.push_str(&format!(
                 "// scalar `{}` (deterministic={}, propagates_null={}, arity={}, return={})\n",
@@ -122,7 +296,128 @@ r##"//! Scalar-function registration.
         }
         s.push('\n');
     }
-    s.push_str("// TODO: emit register_scalar_function calls.\n");
+    s
+}
+
+pub fn registry_rs(plan: &BridgePlan) -> String {
+    let mut s = generated_header();
+    let env_var = format!(
+        "{}_SHIM_WASM",
+        primary_extension_name(plan).to_uppercase().replace('-', "_")
+    );
+    s.push_str(&format!(
+r##"//! Shim registry — loads the composed wasm shim exactly once
+//! at extension-init time and exposes a name → ScalarFunctionDef
+//! lookup for the per-call dispatcher.
+//!
+//! Architecture is identical to sqlink's registry; the only
+//! reason it lives here too is so the generated DuckDB bridge
+//! is self-contained (no cross-bridge deps).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::{{Context, Result}};
+use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
+
+use datafission_df_plugin_api::{{
+    DataTypePlugin, Extension, ExtensionError, ExtensionTarget, SystemCatalogProvider,
+}};
+use datafission_df_plugin_loader::RuntimeWasmExtension;
+use datafission_functions::traits::{{
+    AggregateFunctionDef, ScalarFunctionDef, TableFunctionDef, WindowFunctionDef,
+}};
+
+/// Lazily-loaded shim handle. Initialised in `load_shim()` from
+/// the `{env}` env var.
+static SHIM: OnceCell<ShimRegistry> = OnceCell::new();
+
+struct ShimRegistry {{
+    _ext: RuntimeWasmExtension,  // keep the wasm Store alive
+    scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
+}}
+
+pub fn load_shim() -> Result<()> {{
+    if SHIM.get().is_some() {{
+        return Ok(());
+    }}
+    let path = std::env::var("{env}")
+        .with_context(|| format!(
+            "Set {env}=/path/to/composed-shim.wasm before LOAD"
+        ))?;
+    let ext = RuntimeWasmExtension::from_file(&path)
+        .with_context(|| format!("loading shim {{path}}"))?;
+
+    let mut capture = CapturingTarget {{ scalars: Vec::new() }};
+    ext.register(&mut capture)
+        .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
+
+    let mut scalars = HashMap::with_capacity(capture.scalars.len() * 2);
+    for def in capture.scalars {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            scalars.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        scalars.insert(canonical, def);
+    }}
+
+    SHIM.set(ShimRegistry {{
+        _ext: ext,
+        scalars: RwLock::new(scalars),
+    }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
+
+    Ok(())
+}}
+
+pub fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.scalars.read().get(name).cloned()
+}}
+
+/// Minimal ExtensionTarget that just collects every scalar the
+/// shim registers. Other categories are no-ops until later phases.
+struct CapturingTarget {{
+    scalars: Vec<Arc<dyn ScalarFunctionDef>>,
+}}
+
+impl ExtensionTarget for CapturingTarget {{
+    fn register_scalar_function(
+        &mut self,
+        _namespace: &str,
+        def: Arc<dyn ScalarFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        self.scalars.push(def);
+        Ok(())
+    }}
+    fn register_aggregate_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn AggregateFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+    fn register_table_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn TableFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+    fn register_window_function(
+        &mut self,
+        _namespace: &str,
+        _def: Arc<dyn WindowFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+    fn register_data_type(
+        &mut self,
+        _plugin: Arc<dyn DataTypePlugin>,
+    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+    fn register_system_catalog_provider(
+        &mut self,
+        _provider: Arc<dyn SystemCatalogProvider>,
+    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {{ self }}
+}}
+"##,
+        env = env_var,
+    ));
     s
 }
 

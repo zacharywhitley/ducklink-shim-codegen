@@ -20,6 +20,7 @@ pub fn generate(interface_sqlite: &Path, out_dir: &Path) -> Result<()> {
 
     fs::write(out_dir.join("Cargo.toml"), emit::cargo_toml(&plan))?;
     fs::write(out_dir.join("src/lib.rs"), emit::lib_rs(&plan))?;
+    fs::write(out_dir.join("src/registry.rs"), emit::registry_rs(&plan))?;
     fs::write(out_dir.join("src/scalars.rs"), emit::scalars_rs(&plan))?;
     fs::write(out_dir.join("src/aggregates.rs"), emit::aggregates_rs(&plan))?;
     fs::write(out_dir.join("src/table_functions.rs"), emit::table_functions_rs(&plan))?;
