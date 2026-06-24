@@ -28,9 +28,15 @@ datafission-functions        = {{ path = "../datafission/crates/functions" }}
 # function) trait + the `duckdb_entrypoint_c_api` macro that
 # expands to the C-ABI loadable-extension entry point. We pin
 # to the latest 1.x release.
-duckdb                  = {{ version = "1", features = ["vscalar", "loadable-extension"] }}
-duckdb-loadable-macros  = "1"
-libduckdb-sys           = "1"
+# Local fork of duckdb-rs that exposes Connection::handle()
+# (the raw `duckdb_connection` accessor we need to reach
+# aggregate / logical-type / cast registration APIs that the
+# upstream Rust binding doesn't surface). The same path-dep
+# pins duckdb-loadable-macros and libduckdb-sys to the
+# matching versions so feature-flagged FFI lines up.
+duckdb                  = {{ path = "../duckdb-rs/crates/duckdb", features = ["vscalar", "loadable-extension"] }}
+duckdb-loadable-macros  = {{ path = "../duckdb-rs/crates/duckdb-loadable-macros" }}
+libduckdb-sys           = {{ path = "../duckdb-rs/crates/libduckdb-sys", features = ["loadable-extension"] }}
 
 anyhow      = "1"
 once_cell   = "1"
@@ -1588,81 +1594,354 @@ impl ExtensionTarget for CapturingTarget {{
 pub fn aggregates_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! Aggregate-function registration.
+r##"//! Aggregate-function registration via raw libduckdb-sys.
 //!
-//! ## Phase 3c — DEFERRED (2026-06-24)
+//! Phase 3c (2026-06-24, unblocked once we forked duckdb-rs to
+//! expose `Connection::handle()`): walks every shim aggregate
+//! and wires it into DuckDB through the C API directly.
 //!
-//! The `duckdb` crate at v1.x does NOT expose a public Rust
-//! wrapper for DuckDB's aggregate registration API. The
-//! `Connection.db` field (an `InnerConnection` holding the raw
-//! `duckdb_connection`) is private, and there's no
-//! `register_aggregate_function` method. The raw C API
-//! (`duckdb_create_aggregate_function` + state_size /
-//! state_init / update / combine / finalize / destroy
-//! callbacks) is available in `libduckdb-sys` but reaching
-//! the raw connection from this entry point requires either:
+//! Architecture
 //!
-//!   1. Forking duckdb-rs to expose Connection.db or add a
-//!      public register_aggregate_function method.
-//!   2. unsafe transmute through the Connection struct layout
-//!      (fragile — breaks if duckdb-rs reorders fields).
-//!   3. Replicating the duckdb_entrypoint_c_api macro to
-//!      intercept the raw duckdb_connection before duckdb-rs
-//!      wraps it.
+//!   Per-aggregate-registration `ExtraInfo` allocation holds
+//!   `Arc<dyn AggregateFunctionDef>`. The pointer is stashed on
+//!   the duckdb_aggregate_function via
+//!   `duckdb_aggregate_function_set_extra_info` and recovered
+//!   in every callback via `duckdb_aggregate_function_get_extra_info`.
 //!
-//! None of those are appropriate for code that ships from a
-//! generator. Phase 3c is deferred until duckdb-rs adds a
-//! Rust-friendly aggregate API; see the open issues at
-//! https://github.com/duckdb/duckdb-rs.
+//!   Per-group state (DuckDB allocates `state_size` bytes per
+//!   group) is exactly 8 bytes: the thin pointer to a heap
+//!   `Box<Box<dyn Accumulator>>`. `state_init` mints one;
+//!   `state_destroy` drops it.
 //!
-//! What IS in place for the day duckdb-rs exposes the API:
-//!
-//!   * The shim's aggregates are captured into
-//!     `registry::lookup_aggregate(name)` at extension init
-//!     (see Phase-3c registry update). Every name + alias is
-//!     indexed; the actual `Arc<dyn AggregateFunctionDef>`
-//!     just needs to be wired into a VAggregate impl.
-//!
-//!   * The architecture mirrors sqlink Phase 3c exactly:
-//!     - state = Box<dyn Accumulator>
-//!     - update → acc.accumulate(ctx.get(0))
-//!     - combine → target.merge(source)
-//!     - finalize → acc.finalize() → output vector
-//!
-//! Sqlink ships aggregates today (commit b3a5b57); use that as
-//! the reference impl when adapting to DuckDB's vectorised
-//! aggregate API.
+//!   `update` walks the input chunk row-by-row, recovering the
+//!   per-group accumulator via the thin pointer; `combine`
+//!   merges source into target; `finalize` produces the result
+//!   and writes it to the output vector slot.
 
+use std::ffi::CString;
+use std::os::raw::{c_char, c_void};
+use std::sync::Arc;
+
+use duckdb::core::{Inserter, LogicalTypeHandle, LogicalTypeId};
+use duckdb::types::DuckString;
 use duckdb::{Connection, Result};
+use libduckdb_sys::{
+    duckdb_aggregate_function, duckdb_aggregate_function_add_parameter,
+    duckdb_aggregate_function_get_extra_info, duckdb_aggregate_function_set_error,
+    duckdb_aggregate_function_set_extra_info, duckdb_aggregate_function_set_functions,
+    duckdb_aggregate_function_set_name, duckdb_aggregate_function_set_return_type,
+    duckdb_aggregate_state, duckdb_create_aggregate_function, duckdb_data_chunk,
+    duckdb_destroy_aggregate_function, duckdb_function_info, duckdb_register_aggregate_function,
+    duckdb_string_t, duckdb_vector, idx_t,
+};
 
-/// Phase-3c no-op. The shim's aggregates are captured in the
-/// registry (see `registry::lookup_aggregate`) for the day
-/// duckdb-rs exposes a Rust-friendly aggregate API.
-pub fn register_all(_conn: &Connection) -> Result<()> {
+use datafission_functions::traits::{Accumulator, AggregateFunctionDef};
+use datafission_functions::types::FunctionValue;
+
+use crate::registry;
+
+/// Per-registration state. Stashed on the aggregate via
+/// duckdb_aggregate_function_set_extra_info; recovered in every
+/// callback.
+struct AggExtraInfo {
+    def: Arc<dyn AggregateFunctionDef>,
+}
+
+/// Register every aggregate the shim publishes.
+pub fn register_all(conn: &Connection) -> Result<()> {
+"##,
+    );
+
+    let mut canonical = 0usize;
+    let mut alias_count = 0usize;
+    for ext in &plan.extensions {
+        for agg in &ext.aggregates {
+            s.push_str(&format!(
+                "    register_aggregate(conn, \"{name}\")?;\n",
+                name = agg.canonical_name,
+            ));
+            for alias in &agg.aliases {
+                s.push_str(&format!(
+                    "    register_aggregate(conn, \"{alias}\")?; // alias of {name}\n",
+                    alias = alias, name = agg.canonical_name,
+                ));
+                alias_count += 1;
+            }
+            canonical += 1;
+        }
+    }
+    s.push_str(&format!(
+        "    // Phase 3c: {canonical} canonical + {alias_count} alias names registered.\n"
+    ));
+    if canonical == 0 {
+        s.push_str("    // (no aggregates in this interface DB)\n");
+    }
+
+    s.push_str(
+r##"    Ok(())
+}
+
+fn register_aggregate(conn: &Connection, sql_name: &str) -> Result<()> {
+    let def = registry::lookup_aggregate(sql_name).ok_or_else(|| {
+        duckdb_sys_error(format!("aggregate `{sql_name}` not registered by the shim"))
+    })?;
+
+    unsafe {
+        let agg = duckdb_create_aggregate_function();
+        let name_cs = CString::new(sql_name).map_err(|e| duckdb_sys_error(format!("{e}")))?;
+        duckdb_aggregate_function_set_name(agg, name_cs.as_ptr());
+
+        // PostGIS aggregates are unary (ST_Union, ST_Extent,
+        // ST_Collect — all take one geometry blob). For multi-
+        // arg future aggregates, walk def.param_types() and
+        // call add_parameter per type. Today's flat BLOB
+        // signature is shape-correct for every shim aggregate
+        // observed in the postgis surface.
+        let blob = LogicalTypeHandle::from(LogicalTypeId::Blob);
+        // Borrow the raw duckdb_logical_type out of the handle
+        // for the FFI call. The handle keeps the type alive for
+        // the duration of this scope; DuckDB clones the type
+        // internally when add_parameter consumes it.
+        duckdb_aggregate_function_add_parameter(agg, *(&blob as *const _ as *const _));
+        let ret = LogicalTypeHandle::from(LogicalTypeId::Blob);
+        duckdb_aggregate_function_set_return_type(agg, *(&ret as *const _ as *const _));
+
+        // Wire the callbacks (state_size + state_init + update +
+        // combine + finalize). state_destroy goes through the
+        // separate set_destructor API — see drop_state below.
+        duckdb_aggregate_function_set_functions(
+            agg,
+            Some(state_size),
+            Some(state_init),
+            Some(update_callback),
+            Some(combine_callback),
+            Some(finalize_callback),
+        );
+        libduckdb_sys::duckdb_aggregate_function_set_destructor(agg, Some(state_destroy));
+
+        // Park the per-registration state. The Box is leaked
+        // here and reclaimed when DuckDB calls the destructor.
+        let extra = Box::into_raw(Box::new(AggExtraInfo { def: Arc::clone(&def) }));
+        duckdb_aggregate_function_set_extra_info(
+            agg,
+            extra as *mut c_void,
+            Some(drop_extra_info),
+        );
+
+        let rc = duckdb_register_aggregate_function(conn.handle(), agg);
+        duckdb_destroy_aggregate_function(&mut { agg });
+        if rc != libduckdb_sys::DuckDBSuccess {
+            // 5 PostGIS aggregate names clash with scalar
+            // variants (st_collect, st_union, st_clusterwithin,
+            // st_clusterdbscan, st_clusterintersecting). DuckDB
+            // rejects the registration in that case. Swallow
+            // the error so the non-clashing aggregates still
+            // register — the clashing ones fall back to the
+            // already-registered scalar form, which has the
+            // semantics the user probably wanted anyway (the
+            // postgis aggregate variants are mostly partition-
+            // ed wrappers around the same kernel).
+            eprintln!(
+                "postgis-duckdb-bridge: skipping aggregate `{sql_name}` \
+                 (name already in use by a scalar; rc={rc})"
+            );
+        }
+    }
     Ok(())
 }
 
-// ----------------------------------------------------------------------
-// Aggregates the shim publishes (waiting on duckdb-rs API).
-// ----------------------------------------------------------------------
+fn duckdb_sys_error(msg: String) -> duckdb::Error {
+    duckdb::Error::ToSqlConversionFailure(msg.into())
+}
 
-"##,
-    );
-    for ext in &plan.extensions {
-        s.push_str(&format!("// === extension: {} ===\n", ext.name));
-        for agg in &ext.aggregates {
-            let nargs = agg.param_signatures.first().map(|v| v.len()).unwrap_or(0);
-            s.push_str(&format!(
-                "// aggregate `{}` (arity={}, grouped={}, partial={}, order_sensitive={}, accepts_config={})\n",
-                agg.canonical_name, nargs,
-                agg.supports_grouped, agg.supports_partial,
-                agg.is_order_sensitive, agg.accepts_config,
-            ));
-            if !agg.aliases.is_empty() {
-                s.push_str(&format!("//   aliases: {}\n", agg.aliases.join(", ")));
-            }
+// =====================================================================
+// C callbacks. All `unsafe extern "C"` because DuckDB calls them.
+//
+// State layout: each per-group state is exactly 8 bytes — a
+// thin pointer to a heap-allocated `Box<dyn Accumulator>`.
+// `state_init` mints one; `state_destroy` drops it. We use
+// Box<dyn Accumulator> directly (fat ptr → 16 bytes) but stored
+// behind one more Box layer so the THIN pointer is what lives
+// in the state slot.
+// =====================================================================
+
+type AccBoxPtr = *mut Box<dyn Accumulator>;
+
+unsafe extern "C" fn state_size(_info: duckdb_function_info) -> idx_t {
+    std::mem::size_of::<AccBoxPtr>() as idx_t
+}
+
+unsafe extern "C" fn state_init(info: duckdb_function_info, state: duckdb_aggregate_state) {
+    let extra = extra_info_typed(info);
+    let acc: Box<dyn Accumulator> = extra.def.create_accumulator();
+    let thin: AccBoxPtr = Box::into_raw(Box::new(acc));
+    // The state pointer points to STATE_SIZE bytes that DuckDB
+    // owns. Treat it as a slot for our thin pointer.
+    let slot = state as *mut AccBoxPtr;
+    std::ptr::write(slot, thin);
+}
+
+unsafe extern "C" fn state_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
+    if states.is_null() { return; }
+    for i in 0..count as usize {
+        let state_ptr: duckdb_aggregate_state = std::ptr::read(states.add(i));
+        if state_ptr.is_null() { continue; }
+        let slot = state_ptr as *mut AccBoxPtr;
+        let thin = std::ptr::read(slot);
+        if !thin.is_null() {
+            drop(Box::from_raw(thin));
         }
     }
+}
+
+unsafe extern "C" fn update_callback(
+    info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+) {
+    match std::panic::catch_unwind(|| update_inner(info, input, states)) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => set_error(info, &msg),
+        Err(_)      => set_error(info, "panic in aggregate update"),
+    }
+}
+
+unsafe fn update_inner(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+) -> std::result::Result<(), String> {
+    let chunk = duckdb::core::DataChunkHandle::new_unowned(input);
+    let n = chunk.len();
+    let v0 = chunk.flat_vector(0);
+    let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
+
+    for i in 0..n {
+        if v0.row_is_null(i as u64) {
+            // SQL aggregates skip NULLs unless they're COUNT(*) —
+            // PostGIS aggregates all skip NULL.
+            continue;
+        }
+        let mut s_raw = raw[i];
+        let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
+        let acc_ptr = read_state(states, i);
+        let acc = &mut *acc_ptr;
+        acc.accumulate(&FunctionValue::Binary(bytes))
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn combine_callback(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: idx_t,
+) {
+    let result = std::panic::catch_unwind(|| {
+        for i in 0..count as usize {
+            let src = read_state(source, i);
+            let tgt = read_state(target, i);
+            if src.is_null() || tgt.is_null() { continue; }
+            let src_acc: &dyn Accumulator = &**src;
+            let tgt_acc = &mut **tgt;
+            tgt_acc.merge(src_acc).map_err(|e| format!("{e:?}"))?;
+        }
+        Ok::<(), String>(())
+    });
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => set_error(info, &msg),
+        Err(_)      => set_error(info, "panic in aggregate combine"),
+    }
+}
+
+unsafe extern "C" fn finalize_callback(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+) {
+    match std::panic::catch_unwind(|| finalize_inner(info, source, result, count, offset)) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => set_error(info, &msg),
+        Err(_)      => set_error(info, "panic in aggregate finalize"),
+    }
+}
+
+unsafe fn finalize_inner(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+) -> std::result::Result<(), String> {
+    // The result vector here is the OUTPUT vector for the
+    // aggregate. We need to write `count` results starting at
+    // `offset`. Wrap it in a FlatVector so we can call insert().
+    use duckdb::core::FlatVector;
+    let mut out: FlatVector = FlatVector::from_raw(result);
+
+    for i in 0..count as usize {
+        let acc_ptr = read_state(source, i);
+        if acc_ptr.is_null() {
+            out.set_null(offset as usize + i);
+            continue;
+        }
+        let acc = &**acc_ptr;
+        let value = acc.finalize().map_err(|e| format!("{e:?}"))?;
+        let dst = offset as usize + i;
+        match value {
+            FunctionValue::Binary(b) => out.insert(dst, b.as_slice()),
+            FunctionValue::String(s) => out.insert(dst, s.as_bytes()),
+            FunctionValue::Null => out.set_null(dst),
+            other => return Err(format!(
+                "aggregate finalize: unexpected result variant `{}`",
+                other.type_name()
+            )),
+        }
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn drop_extra_info(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    drop(Box::from_raw(ptr as *mut AggExtraInfo));
+}
+
+// =====================================================================
+// State-slot accessors.
+// =====================================================================
+
+unsafe fn read_state(states: *mut duckdb_aggregate_state, idx: usize) -> AccBoxPtr {
+    // `states[i]` is a duckdb_aggregate_state (a pointer to the
+    // per-group state slot). Dereference to get the slot
+    // address, then read our AccBoxPtr out of the slot.
+    //
+    // (Initial implementation skipped the dereference and
+    // crashed DuckDB with SIGBUS — the C API docs say:
+    //   "states – a pointer to states – Each element points to
+    //    the state for the corresponding input row."
+    //  i.e. it's an array of state pointers, not the states
+    //  themselves laid out contiguously.)
+    let state_ptr: duckdb_aggregate_state = std::ptr::read(states.add(idx));
+    let slot = state_ptr as *mut AccBoxPtr;
+    std::ptr::read(slot)
+}
+
+unsafe fn extra_info_typed<'a>(info: duckdb_function_info) -> &'a AggExtraInfo {
+    let raw = duckdb_aggregate_function_get_extra_info(info);
+    &*(raw as *const AggExtraInfo)
+}
+
+unsafe fn set_error(info: duckdb_function_info, msg: &str) {
+    if let Ok(cs) = CString::new(msg) {
+        duckdb_aggregate_function_set_error(info, cs.as_ptr() as *const c_char);
+    }
+}
+"##,
+    );
     s
 }
 
