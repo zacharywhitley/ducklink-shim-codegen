@@ -158,18 +158,75 @@ SQL
 
 Verified 2026-06-24 against DuckDB v1.5.2 on osx_arm64.
 
-### Phase 2 — additional signature shapes
+### Phase 2 — additional signature shapes ✅ LANDED 2026-06-24
 
-- [ ] Add marker structs + VScalar impls for other common
-      shapes: `BlobToVarcharScalar` (ST_AsText), `BlobToBlobScalar`
-      (ST_Buffer + most processing fns), `BlobBlobToBoolScalar`
-      (predicates), `BlobBlobToBlobScalar` (set ops + geo args),
-      `BlobToF64Scalar` (measurements).
-- [ ] Map FunctionValue ↔ DuckDB BLOB/VARCHAR/BOOLEAN/BIGINT/
-      DOUBLE in each direction.
-- [ ] Wire NULL propagation: today's TextToBlobScalar treats
-      input NULLs as empty strings. DuckDB exposes validity
-      bitmaps via the vscalar API — use them.
+Eight VScalar marker structs landed, covering the top eight
+PostGIS scalar shapes (about 235 of 395 canonical scalars =
+~59 % surface coverage):
+
+  text         → blob    TextToBlobScalar      (ST_GeomFromText)
+  blob         → blob    BlobToBlobScalar      (ST_Centroid)
+  blob,blob    → bool    BlobBlobToBoolScalar  (ST_Intersects)
+  blob         → f64     BlobToF64Scalar       (ST_Length, ST_Area)
+  blob,f64     → blob    BlobF64ToBlobScalar   (ST_Buffer)
+  blob         → text    BlobToTextScalar      (ST_AsText)
+  blob,blob    → blob    BlobBlobToBlobScalar  (ST_Union)
+  blob,blob    → f64     BlobBlobToF64Scalar   (ST_Distance)
+
+Each shape has its own VScalar impl + `register_<shape>(conn,
+name)` helper. The codegen's `classify_shape(sc)` matches
+`(param_signatures[0].as_slice(), return_type.as_str())` and
+emits one helper call per scalar.
+
+A `lookup(sql_name)` helper centralises the registry lookup
++ error wrapping; `insert_blob_result::<S>` centralises the
+blob-output write across the four shapes returning blob.
+
+**Critical fix during Phase 2**: BLOB inputs MUST be read via
+`DuckString::as_bytes()` not `as_str().as_bytes()` — the
+`as_str` path does lossy UTF-8 conversion (replacing invalid
+sequences with U+FFFD), which mangles WKB and produces
+nonsense output. Took me 30 minutes of "POINT(-0.96875…)"
+garbage to spot. Documented at every BLOB read site.
+
+**Borrow-checker workaround for primitive output shapes**:
+DuckDB's `FlatVector::as_mut_slice_with_len` and `set_null`
+both borrow `&mut self` — can't have both alive in the same
+scope. The shape impls collect null indices into a `Vec<usize>`
+during the slice-write loop, then apply `set_null` in a second
+pass after the slice borrow ends.
+
+Verified end-to-end (each call goes through the full shim
+dispatch):
+
+  ST_AsText(ST_GeomFromText('POINT(1 1)'))           → POINT(1 1)
+  ST_Length(LINESTRING(0 0,1 1,2 2))                 → 2.8284271…
+  ST_Area(POLYGON((0 0,4 0,4 4,0 4,0 0)))            → 16
+  ST_Distance(POINT(0 0), POINT(3 4))                → 5
+  ST_Intersects(POLYGON(…), POINT(2 2))              → true
+  ST_Intersects(POLYGON(…), POINT(10 10))            → false
+  ST_Centroid(ST_Buffer(POINT(0 0), 1.0))            → POINT(0 0)
+  -- Vectorised batch through ST_GeomFromText + ST_Area:
+  SELECT sum(ST_Area(ST_GeomFromText('POLYGON((0 0,'||(i+1)||' 0,'||(i+1)||' '||(i+1)||',0 '||(i+1)||',0 0))')))
+    FROM range(1,11) t(i);                            → 505 (= 2²+3²+…+11²)
+
+### Phase 3 — remaining surface
+
+Histogram of deferred shapes from `register_all`'s trailing
+comment block. Top remaining shapes (each is a new VScalar
+marker + register helper):
+
+  blob          → uint32      (~13)  ST_NumPoints, ST_NumGeometries
+  blob,uint32   → blob        (~12)  ST_GeometryN, ST_PointN
+  blob,int32    → blob        (~11)  ST_SetSRID
+  blob,f64,f64  → blob        (~11)  ST_Translate(2D)
+  blob          → int32       (~8)
+  blob,blob,f64 → bool        (~6)   ST_DWithin
+
+Should add NULL-propagation handling per the new
+`propagates_null` field on `ScalarFn` (today every shape
+processes NULLs as zero-bytes; needs a check + early
+set_null branch).
 
 ### Phase 3 — aggregates / windows
 
