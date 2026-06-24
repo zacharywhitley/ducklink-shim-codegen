@@ -104,6 +104,12 @@ pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
     scalars::register_all(&conn).map_err(|e| {{
         format!("scalar registration: {{e}}")
     }})?;
+    // Phase 3c — aggregates currently a no-op (duckdb-rs has no
+    // aggregate API). Captures still happen in registry so a
+    // future flip-on is mechanical.
+    aggregates::register_all(&conn).map_err(|e| {{
+        format!("aggregate registration: {{e}}")
+    }})?;
     Ok(())
 }}
 "##,
@@ -1122,6 +1128,7 @@ static SHIM: OnceCell<ShimRegistry> = OnceCell::new();
 struct ShimRegistry {{
     _ext: RuntimeWasmExtension,  // keep the wasm Store alive
     scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
+    aggregates: RwLock<HashMap<String, Arc<dyn AggregateFunctionDef>>>,
 }}
 
 pub fn load_shim() -> Result<()> {{
@@ -1135,7 +1142,10 @@ pub fn load_shim() -> Result<()> {{
     let ext = RuntimeWasmExtension::from_file(&path)
         .with_context(|| format!("loading shim {{path}}"))?;
 
-    let mut capture = CapturingTarget {{ scalars: Vec::new() }};
+    let mut capture = CapturingTarget {{
+        scalars: Vec::new(),
+        aggregates: Vec::new(),
+    }};
     ext.register(&mut capture)
         .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
 
@@ -1147,10 +1157,19 @@ pub fn load_shim() -> Result<()> {{
         }}
         scalars.insert(canonical, def);
     }}
+    let mut aggregates = HashMap::with_capacity(capture.aggregates.len() * 2);
+    for def in capture.aggregates {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            aggregates.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        aggregates.insert(canonical, def);
+    }}
 
     SHIM.set(ShimRegistry {{
         _ext: ext,
         scalars: RwLock::new(scalars),
+        aggregates: RwLock::new(aggregates),
     }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
 
     Ok(())
@@ -1161,10 +1180,17 @@ pub fn lookup_scalar(name: &str) -> Option<Arc<dyn ScalarFunctionDef>> {{
     r.scalars.read().get(name).cloned()
 }}
 
-/// Minimal ExtensionTarget that just collects every scalar the
-/// shim registers. Other categories are no-ops until later phases.
+pub fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.aggregates.read().get(name).cloned()
+}}
+
+/// ExtensionTarget that captures every scalar and aggregate the
+/// shim registers. UDTFs / windows / types / etc. are accepted
+/// as no-ops until later phases.
 struct CapturingTarget {{
     scalars: Vec<Arc<dyn ScalarFunctionDef>>,
+    aggregates: Vec<Arc<dyn AggregateFunctionDef>>,
 }}
 
 impl ExtensionTarget for CapturingTarget {{
@@ -1179,8 +1205,11 @@ impl ExtensionTarget for CapturingTarget {{
     fn register_aggregate_function(
         &mut self,
         _namespace: &str,
-        _def: Arc<dyn AggregateFunctionDef>,
-    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+        def: Arc<dyn AggregateFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        self.aggregates.push(def);
+        Ok(())
+    }}
     fn register_table_function(
         &mut self,
         _namespace: &str,
@@ -1212,24 +1241,79 @@ pub fn aggregates_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Aggregate-function registration.
 //!
-//! DuckDB AggregateFunction needs: state_size, initialize,
-//! update, combine, finalize, destructor. State holds the shim's
-//! accumulator handle.
+//! ## Phase 3c — DEFERRED (2026-06-24)
+//!
+//! The `duckdb` crate at v1.x does NOT expose a public Rust
+//! wrapper for DuckDB's aggregate registration API. The
+//! `Connection.db` field (an `InnerConnection` holding the raw
+//! `duckdb_connection`) is private, and there's no
+//! `register_aggregate_function` method. The raw C API
+//! (`duckdb_create_aggregate_function` + state_size /
+//! state_init / update / combine / finalize / destroy
+//! callbacks) is available in `libduckdb-sys` but reaching
+//! the raw connection from this entry point requires either:
+//!
+//!   1. Forking duckdb-rs to expose Connection.db or add a
+//!      public register_aggregate_function method.
+//!   2. unsafe transmute through the Connection struct layout
+//!      (fragile — breaks if duckdb-rs reorders fields).
+//!   3. Replicating the duckdb_entrypoint_c_api macro to
+//!      intercept the raw duckdb_connection before duckdb-rs
+//!      wraps it.
+//!
+//! None of those are appropriate for code that ships from a
+//! generator. Phase 3c is deferred until duckdb-rs adds a
+//! Rust-friendly aggregate API; see the open issues at
+//! https://github.com/duckdb/duckdb-rs.
+//!
+//! What IS in place for the day duckdb-rs exposes the API:
+//!
+//!   * The shim's aggregates are captured into
+//!     `registry::lookup_aggregate(name)` at extension init
+//!     (see Phase-3c registry update). Every name + alias is
+//!     indexed; the actual `Arc<dyn AggregateFunctionDef>`
+//!     just needs to be wired into a VAggregate impl.
+//!
+//!   * The architecture mirrors sqlink Phase 3c exactly:
+//!     - state = Box<dyn Accumulator>
+//!     - update → acc.accumulate(ctx.get(0))
+//!     - combine → target.merge(source)
+//!     - finalize → acc.finalize() → output vector
+//!
+//! Sqlink ships aggregates today (commit b3a5b57); use that as
+//! the reference impl when adapting to DuckDB's vectorised
+//! aggregate API.
+
+use duckdb::{Connection, Result};
+
+/// Phase-3c no-op. The shim's aggregates are captured in the
+/// registry (see `registry::lookup_aggregate`) for the day
+/// duckdb-rs exposes a Rust-friendly aggregate API.
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Aggregates the shim publishes (waiting on duckdb-rs API).
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for agg in &ext.aggregates {
+            let nargs = agg.param_signatures.first().map(|v| v.len()).unwrap_or(0);
             s.push_str(&format!(
-                "// aggregate `{}` (grouped={}, partial={}, accepts_config={})\n",
-                agg.canonical_name,
-                agg.supports_grouped,
-                agg.supports_partial,
-                agg.accepts_config,
+                "// aggregate `{}` (arity={}, grouped={}, partial={}, order_sensitive={}, accepts_config={})\n",
+                agg.canonical_name, nargs,
+                agg.supports_grouped, agg.supports_partial,
+                agg.is_order_sensitive, agg.accepts_config,
             ));
+            if !agg.aliases.is_empty() {
+                s.push_str(&format!("//   aliases: {}\n", agg.aliases.join(", ")));
+            }
         }
     }
-    s.push_str("\n// TODO: emit register_aggregate_function calls.\n");
     s
 }
 
