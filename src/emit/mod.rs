@@ -98,20 +98,22 @@ use duckdb_loadable_macros::duckdb_entrypoint_c_api;
 /// `{env}` env var so the bridge isn't pinned to
 /// a build-time location (matches the host's runtime-loaded
 /// model).
-#[duckdb_entrypoint_c_api(ext_name = "{name}_duckdb_bridge", min_duckdb_version = "v0.0.1")]
+#[duckdb_entrypoint_c_api(ext_name = "{name}_duckdb_bridge", min_duckdb_version = "v1.2.0")]
 pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
+    // Phase 4b — register custom types first. Independent of the
+    // shim load: aliases-as-BLOB only need a duckdb_connection,
+    // not a working wasm component. Running this before the shim
+    // load means `CREATE TABLE t (g GEOMETRY)` still works even
+    // if shim loading fails (e.g. wasm not on disk yet).
+    types::register_all(&conn).map_err(|e| {{
+        format!("type registration: {{e}}")
+    }})?;
     registry::load_shim().map_err(|e| {{
         // Use the alternate `:#` formatter so anyhow walks the
         // cause chain; without it, the inner wasm-loader error
         // gets hidden behind whatever with_context wrapper is
         // outermost.
         format!("shim load: {{e:#}}")
-    }})?;
-    // Phase 4b — custom types first so signatures referencing
-    // them resolve. Currently a no-op (see types.rs for the
-    // duckdb-rs blocker).
-    types::register_all(&conn).map_err(|e| {{
-        format!("type registration: {{e}}")
     }})?;
     scalars::register_all(&conn).map_err(|e| {{
         format!("scalar registration: {{e}}")
@@ -2034,53 +2036,87 @@ r##"//! Window-function registration.
 pub fn types_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! Custom column types.
+r##"//! Custom column types — alias BLOB as GEOMETRY, GEOGRAPHY, …
 //!
-//! ## Phase 4b — DEFERRED (2026-06-24)
+//! Each shim type is registered with DuckDB as an alias for
+//! `BLOB`. After registration `CREATE TABLE t (g GEOMETRY)`
+//! shows `GEOMETRY` in the schema; storage and the function
+//! ABI stay BLOB so existing `ScalarFunctionSignature::exact`
+//! signatures keep working unchanged.
 //!
-//! Same architectural blocker as aggregates (Phase 3c). The
-//! C API `duckdb_register_logical_type` exists in
-//! `libduckdb-sys` and would let `CREATE TABLE t (g GEOMETRY)`
-//! show `GEOMETRY` in the schema instead of `BLOB`. But
-//! reaching the raw `duckdb_connection` from this entry point
-//! requires Connection internals that duckdb-rs doesn't
-//! expose publicly:
+//! For each registered type name we call:
 //!
-//!   1. `Connection.db: RefCell<InnerConnection>` is private.
-//!   2. There's no `register_logical_type` method on
-//!      Connection.
-//!   3. Raw FFI via libduckdb-sys would need either
-//!      unsafe-transmute through the Connection struct layout
-//!      (fragile) or a fork of duckdb-rs.
+//!     handle = duckdb_create_logical_type(DUCKDB_TYPE_BLOB)
+//!     duckdb_logical_type_set_alias(handle, "GEOMETRY")
+//!     duckdb_register_logical_type(con, handle, NULL)
+//!     duckdb_destroy_logical_type(handle)
 //!
-//! What I CAN do in the meantime (and DID do via Phase 2):
-//! every shape's `ScalarFunctionSignature::exact(...)`
-//! declares parameter types as `LogicalTypeId::Blob`. DuckDB
-//! infers from this that the columns are BLOB. The function
-//! works; the schema just shows BLOB rather than GEOMETRY.
-//!
-//! What the DuckDB spatial extension does (and what we
-//! would need to replicate when duckdb-rs ships the API):
-//!
-//!   let mut geom = LogicalTypeHandle::from(LogicalTypeId::Blob);
-//!   geom.set_alias("GEOMETRY");
-//!   conn.register_logical_type("GEOMETRY", geom)?;
-//!
-//! When duckdb-rs exposes `register_logical_type`, this file
-//! becomes a register_all that walks `plan.column_types`,
-//! creates one aliased LogicalType per column-type entry,
-//! and registers each with the connection.
+//! `duckdb_create_type_info` is reserved-for-future-use per
+//! upstream comments — we pass NULL. On a name clash with an
+//! existing type DuckDB returns DuckDBError; we log+continue
+//! to match the policy aggregates_rs uses for scalar/aggregate
+//! collisions.
 
 use duckdb::{Connection, Result};
+use libduckdb_sys as ffi;
+use std::ffi::CString;
 
-/// Phase-4b no-op. Column types are tracked in the registry
-/// for the day duckdb-rs exposes register_logical_type.
-pub fn register_all(_conn: &Connection) -> Result<()> {
+pub fn register_all(conn: &Connection) -> Result<()> {
+    let con = conn.handle();
+    if con.is_null() {
+        return Ok(());
+    }
+    unsafe {
+"##,
+    );
+    let mut names: Vec<String> = Vec::new();
+    for ext in &plan.extensions {
+        for ct in &ext.column_types {
+            let n = ct.type_name.trim().to_string();
+            if !n.is_empty() {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    for n in &names {
+        s.push_str(&format!("        register_type(con, {:?});\n", n));
+    }
+    s.push_str(
+r##"    }
     Ok(())
 }
 
+unsafe fn register_type(con: ffi::duckdb_connection, name: &str) {
+    let handle = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    if handle.is_null() {
+        eprintln!("[shim-types] could not create logical type for {name}");
+        return;
+    }
+    let c_name = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[shim-types] type name contains NUL: {name}");
+            let mut h = handle;
+            ffi::duckdb_destroy_logical_type(&mut h);
+            return;
+        }
+    };
+    ffi::duckdb_logical_type_set_alias(handle, c_name.as_ptr());
+    let rc = ffi::duckdb_register_logical_type(con, handle, std::ptr::null_mut());
+    if rc != ffi::DuckDBSuccess {
+        eprintln!(
+            "[shim-types] could not register type {name} (rc={rc}) — \
+             likely a name clash with an existing type"
+        );
+    }
+    let mut h = handle;
+    ffi::duckdb_destroy_logical_type(&mut h);
+}
+
 // ----------------------------------------------------------------------
-// Column types the shim publishes (waiting on duckdb-rs API).
+// Column types the shim publishes.
 // ----------------------------------------------------------------------
 
 "##,
