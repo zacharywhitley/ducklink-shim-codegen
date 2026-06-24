@@ -101,6 +101,12 @@ pub fn extension_entrypoint(conn: Connection) -> Result<(), Box<dyn Error>> {{
         // outermost.
         format!("shim load: {{e:#}}")
     }})?;
+    // Phase 4b — custom types first so signatures referencing
+    // them resolve. Currently a no-op (see types.rs for the
+    // duckdb-rs blocker).
+    types::register_all(&conn).map_err(|e| {{
+        format!("type registration: {{e}}")
+    }})?;
     scalars::register_all(&conn).map_err(|e| {{
         format!("scalar registration: {{e}}")
     }})?;
@@ -1698,19 +1704,57 @@ pub fn types_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Custom column types.
 //!
-//! DuckDB DOES have first-class custom types via
-//! `LogicalType::user(name)`. Register each shim column-type as
-//! a USER type that internally aliases BLOB (or VARCHAR for
-//! text-based shims like WKT).
+//! ## Phase 4b — DEFERRED (2026-06-24)
 //!
-//!   let geom = LogicalType::user("GEOMETRY");
-//!   con.register_type("GEOMETRY", geom)?;
+//! Same architectural blocker as aggregates (Phase 3c). The
+//! C API `duckdb_register_logical_type` exists in
+//! `libduckdb-sys` and would let `CREATE TABLE t (g GEOMETRY)`
+//! show `GEOMETRY` in the schema instead of `BLOB`. But
+//! reaching the raw `duckdb_connection` from this entry point
+//! requires Connection internals that duckdb-rs doesn't
+//! expose publicly:
 //!
-//! Casts to/from native types are emitted in casts.rs.
+//!   1. `Connection.db: RefCell<InnerConnection>` is private.
+//!   2. There's no `register_logical_type` method on
+//!      Connection.
+//!   3. Raw FFI via libduckdb-sys would need either
+//!      unsafe-transmute through the Connection struct layout
+//!      (fragile) or a fork of duckdb-rs.
+//!
+//! What I CAN do in the meantime (and DID do via Phase 2):
+//! every shape's `ScalarFunctionSignature::exact(...)`
+//! declares parameter types as `LogicalTypeId::Blob`. DuckDB
+//! infers from this that the columns are BLOB. The function
+//! works; the schema just shows BLOB rather than GEOMETRY.
+//!
+//! What the DuckDB spatial extension does (and what we
+//! would need to replicate when duckdb-rs ships the API):
+//!
+//!   let mut geom = LogicalTypeHandle::from(LogicalTypeId::Blob);
+//!   geom.set_alias("GEOMETRY");
+//!   conn.register_logical_type("GEOMETRY", geom)?;
+//!
+//! When duckdb-rs exposes `register_logical_type`, this file
+//! becomes a register_all that walks `plan.column_types`,
+//! creates one aliased LogicalType per column-type entry,
+//! and registers each with the connection.
+
+use duckdb::{Connection, Result};
+
+/// Phase-4b no-op. Column types are tracked in the registry
+/// for the day duckdb-rs exposes register_logical_type.
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Column types the shim publishes (waiting on duckdb-rs API).
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for ct in &ext.column_types {
             s.push_str(&format!(
                 "// type_id={:5} name={:<24} size={:>4}  cast_from={:?}  cast_to={:?}\n",
@@ -1718,7 +1762,6 @@ r##"//! Custom column types.
             ));
         }
     }
-    s.push_str("\n// TODO: emit register_type calls.\n");
     s
 }
 
