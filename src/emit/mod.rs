@@ -158,6 +158,12 @@ unsafe fn entrypoint_inner(
     // failed to load.
     types::register_all(raw_con);
 
+    // Step 4b — register identity casts BLOB <-> alias so
+    // INSERT INTO t (GEOMETRY) VALUES (ST_GeomFromText(...))
+    // doesn't fail with "Unimplemented type for cast
+    // (BLOB -> GEOMETRY)". Must run after types::register_all.
+    casts::register_all(raw_con);
+
     // Step 5 — load the wasm shim.
     registry::load_shim()
         .map_err(|e| -> Box<dyn Error> {{ format!("shim load: {{e:#}}").into() }})?;
@@ -2810,30 +2816,183 @@ pub fn register_all(_conn: &Connection) -> Result<()> {
 pub fn casts_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! CAST(x AS T) — DuckDB has cast hooks for USER types.
+r##"//! CAST(x AS T) — identity casts for shim-published alias types.
 //!
-//! ## Phase 4d — partially blocked
+//! ## Phase 4d (this pass) — BLOB <-> alias identity casts
 //!
-//! For `source_kind == "any"` casts, DuckDB exposes
-//! register_cast_function — but routing INTO it requires the
-//! same private `Connection.db` we're blocked on for
-//! aggregates (Phase 3c) and custom types (Phase 4b). Both
-//! prerequisites would unblock this together.
+//! Because every shim-published type (GEOMETRY, GEOGRAPHY,
+//! STBOX, ...) is registered as an alias of BLOB
+//! (`types::register_all`), the wire format is identical;
+//! casts between BLOB and any alias are bytewise no-ops. Without
+//! registering them, DuckDB rejects every
+//! `CREATE TABLE t (g GEOMETRY); INSERT INTO t VALUES
+//! (ST_GeomFromText(...))` with "Unimplemented type for cast
+//! (BLOB -> GEOMETRY)" since the function returns BLOB and the
+//! column expects GEOMETRY.
 //!
-//! For `source_kind == "stringliteral"` and `"geographycolumn"`,
-//! the rewrite is source-shape-driven (look at the expression
-//! shape, not the type) — DuckDB's CAST hooks are type-driven,
-//! so even when the API ships, these rewrites need to go to
-//! the `ducklink-preprocess` crate instead.
+//! Per alias name N, we register two casts:
+//!   - BLOB -> N   (implicit cast, allows INSERT INTO t (N) VALUES (blob_fn(...)))
+//!   - N -> BLOB   (implicit cast, allows blob_fn(t.n_column))
+//!
+//! Both share a single identity callback: read each row's
+//! string_t from the input vector, write the same bytes to the
+//! output via `duckdb_vector_assign_string_element_len`. The
+//! callback is reused across every registered cast.
+//!
+//! ## Out of scope for this pass — functional casts
+//!
+//! Casts like `CAST(text AS GEOMETRY) -> ST_GeomFromText(text)`
+//! are source-shape driven (depends on what the source expression
+//! IS, not just its type). DuckDB's cast hooks are type-driven,
+//! so those rewrites belong in `shim-sql-preprocess` at the AST
+//! layer, which already handles them.
 
-use duckdb::{Connection, Result};
+use libduckdb_sys::{
+    self as ffi, DuckDBSuccess, duckdb_function_info,
+    duckdb_connection, duckdb_data_chunk_get_size,
+    duckdb_string_t, duckdb_vector, duckdb_vector_get_data,
+    duckdb_vector_get_validity, duckdb_validity_row_is_valid,
+    duckdb_validity_set_row_invalid, duckdb_vector_ensure_validity_writable,
+    duckdb_vector_assign_string_element_len, idx_t,
+};
+use std::ffi::CString;
+use std::os::raw::c_char;
 
-pub fn register_all(_conn: &Connection) -> Result<()> {
-    Ok(())
+/// Register every BLOB <-> alias identity cast the shim
+/// publishes via `column_types`.
+///
+/// # Safety
+///
+/// `con` must be a valid `duckdb_connection` for the duration
+/// of this call.
+pub unsafe fn register_all(con: duckdb_connection) {
+    if con.is_null() {
+        return;
+    }
+"##,
+    );
+    let mut names: Vec<String> = Vec::new();
+    for ext in &plan.extensions {
+        for ct in &ext.column_types {
+            let n = ct.type_name.trim().to_string();
+            if !n.is_empty() {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    for n in &names {
+        s.push_str(&format!("    register_identity_cast(con, {:?});\n", n));
+    }
+    s.push_str(
+r##"}
+
+unsafe fn register_identity_cast(con: duckdb_connection, alias: &str) {
+    let blob = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    let aliased = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    if blob.is_null() || aliased.is_null() {
+        eprintln!("[shim-casts] could not create logical type for {alias}");
+        return;
+    }
+    let c_alias = match CString::new(alias) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[shim-casts] alias name contains NUL: {alias}");
+            let (mut a, mut b) = (aliased, blob);
+            ffi::duckdb_destroy_logical_type(&mut a);
+            ffi::duckdb_destroy_logical_type(&mut b);
+            return;
+        }
+    };
+    ffi::duckdb_logical_type_set_alias(aliased, c_alias.as_ptr());
+
+    // BLOB -> alias
+    register_one_direction(con, blob, aliased, alias, "blob_to_alias");
+    // alias -> BLOB
+    register_one_direction(con, aliased, blob, alias, "alias_to_blob");
+
+    let (mut a, mut b) = (aliased, blob);
+    ffi::duckdb_destroy_logical_type(&mut a);
+    ffi::duckdb_destroy_logical_type(&mut b);
+}
+
+unsafe fn register_one_direction(
+    con: duckdb_connection,
+    source: ffi::duckdb_logical_type,
+    target: ffi::duckdb_logical_type,
+    alias: &str,
+    direction: &str,
+) {
+    let cast = ffi::duckdb_create_cast_function();
+    ffi::duckdb_cast_function_set_source_type(cast, source);
+    ffi::duckdb_cast_function_set_target_type(cast, target);
+    // Cost of 1 — explicit casts always free; implicit casts
+    // prefer this over more-expensive paths but DuckDB's own
+    // built-ins (cost 0) still win where they apply.
+    ffi::duckdb_cast_function_set_implicit_cast_cost(cast, 1);
+    ffi::duckdb_cast_function_set_function(cast, Some(identity_cast_callback));
+
+    let rc = ffi::duckdb_register_cast_function(con, cast);
+    let mut c = cast;
+    ffi::duckdb_destroy_cast_function(&mut c);
+    if rc != DuckDBSuccess {
+        eprintln!(
+            "[shim-casts] {direction} for {alias} failed (rc={rc}) — \
+             may already be registered or a built-in handles it"
+        );
+    }
+}
+
+/// Per-row identity copy: every BLOB-shaped value is bytewise
+/// identical between the source and target representations
+/// because both sides are LogicalTypeId::Blob. We just memcpy
+/// each row from the input vector to the output.
+///
+/// # Safety
+///
+/// Called by DuckDB. `input` / `output` are valid
+/// `duckdb_vector` handles for the duration of the call.
+unsafe extern "C" fn identity_cast_callback(
+    _info: duckdb_function_info,
+    count: idx_t,
+    input: duckdb_vector,
+    output: duckdb_vector,
+) -> bool {
+    let n = count as usize;
+    if n == 0 {
+        return true;
+    }
+    let in_data = duckdb_vector_get_data(input) as *const duckdb_string_t;
+    let in_validity = duckdb_vector_get_validity(input);
+
+    for i in 0..n {
+        if !in_validity.is_null() && !duckdb_validity_row_is_valid(in_validity, i as idx_t) {
+            duckdb_vector_ensure_validity_writable(output);
+            let out_validity = duckdb_vector_get_validity(output);
+            if !out_validity.is_null() {
+                duckdb_validity_set_row_invalid(out_validity, i as idx_t);
+            }
+            continue;
+        }
+        let mut s_raw: duckdb_string_t = std::ptr::read(in_data.add(i));
+        let len = ffi::duckdb_string_t_length(s_raw) as usize;
+        let p = ffi::duckdb_string_t_data(&mut s_raw as *mut duckdb_string_t);
+        duckdb_vector_assign_string_element_len(
+            output,
+            i as idx_t,
+            p as *const c_char,
+            len as idx_t,
+        );
+    }
+
+    // Touch `count` to silence the unused warning on early-return paths.
+    let _ = duckdb_data_chunk_get_size;
+    true
 }
 
 // ----------------------------------------------------------------------
-// Cast rewrites the shim advertises.
+// Cast rewrites the shim advertises (for future functional-cast pass).
 // ----------------------------------------------------------------------
 
 "##,
