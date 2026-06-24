@@ -292,6 +292,17 @@ fn lookup(sql_name: &str) -> Result<Arc<dyn ScalarFunctionDef>> {
     )))
 }
 
+// Phase 3b (2026-06-24): NULL propagation.
+//
+// Per-shape `invoke` impls call `state.propagates_null()` once
+// at the top of the loop and, for each row, check the held
+// `FlatVector::row_is_null(row as u64)` on each input. We can't
+// share a `row_has_null_input(input, row, n)` helper because
+// the existing per-row code already holds the FlatVectors
+// (which borrow `input`) — the helper would re-borrow `input`
+// and trigger the borrow checker. Each shape inlines the check
+// using its already-held v0 (and v1, v2 where applicable).
+
 // ====================================================================
 // Per-shape register_ + VScalar impls.
 //
@@ -326,7 +337,12 @@ impl VScalar for TextToBlobScalar {
         let v0 = input.flat_vector(0);
         let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null && v0.row_is_null(i as u64) {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = raw[i];
             let s: String = DuckString::new(&mut s_raw).as_str().into_owned();
             let r = state.execute(&[FunctionValue::String(s)])
@@ -360,12 +376,16 @@ impl VScalar for BlobToBlobScalar {
         let v0 = input.flat_vector(0);
         let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null && v0.row_is_null(i as u64) {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = raw[i];
             // BLOBs and VARCHAR share the duckdb_string_t shape;
-            // DuckString returns the bytes via as_str (lossy UTF-8
-            // decode) — fine for WKB since we round-trip through
-            // the bytes layer.
+            // DuckString::as_bytes returns the raw bytes (no UTF-8
+            // conversion) — required for WKB round-tripping.
             let bytes: Vec<u8> = DuckString::new(&mut s_raw)
                 .as_bytes().to_vec();
             let r = state.execute(&[FunctionValue::Binary(bytes)])
@@ -404,9 +424,16 @@ impl VScalar for BlobBlobToBoolScalar {
         // Same two-pass pattern as BlobToF64Scalar: can't hold the
         // mutable slice borrow AND call set_null in the same scope.
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<bool>(n) };
             for i in 0..n {
+                if propagates_null
+                    && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+                {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut a = r0[i];
                 let mut b = r1[i];
                 let ab: Vec<u8> = DuckString::new(&mut a).as_bytes().to_vec();
@@ -464,9 +491,14 @@ impl VScalar for BlobToF64Scalar {
         // alive at the same iteration. Two-pass keeps lifetimes
         // disjoint.
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<f64>(n) };
             for i in 0..n {
+                if propagates_null && v0.row_is_null(i as u64) {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut s_raw = raw[i];
                 let bytes: Vec<u8> = DuckString::new(&mut s_raw)
                     .as_bytes().to_vec();
@@ -515,7 +547,14 @@ impl VScalar for BlobF64ToBlobScalar {
         let r0 = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let r1 = unsafe { v1.as_slice_with_len::<f64>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null
+                && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+            {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = r0[i];
             let bytes: Vec<u8> = DuckString::new(&mut s_raw)
                 .as_bytes().to_vec();
@@ -555,7 +594,12 @@ impl VScalar for BlobToTextScalar {
         let v0 = input.flat_vector(0);
         let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null && v0.row_is_null(i as u64) {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = raw[i];
             let bytes: Vec<u8> = DuckString::new(&mut s_raw)
                 .as_bytes().to_vec();
@@ -600,7 +644,14 @@ impl VScalar for BlobBlobToBlobScalar {
         let r0 = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let r1 = unsafe { v1.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null
+                && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+            {
+                out.set_null(i);
+                continue;
+            }
             let mut a = r0[i];
             let mut b = r1[i];
             let ab: Vec<u8> = DuckString::new(&mut a).as_bytes().to_vec();
@@ -644,9 +695,16 @@ impl VScalar for BlobBlobToF64Scalar {
         let r1 = unsafe { v1.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<f64>(n) };
             for i in 0..n {
+                if propagates_null
+                    && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+                {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut a = r0[i];
                 let mut b = r1[i];
                 let ab: Vec<u8> = DuckString::new(&mut a).as_bytes().to_vec();
@@ -700,9 +758,14 @@ impl VScalar for BlobToU32Scalar {
         let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<u32>(n) };
             for i in 0..n {
+                if propagates_null && v0.row_is_null(i as u64) {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut s_raw = raw[i];
                 let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
                 let r = state.execute(&[FunctionValue::Binary(bytes)])
@@ -749,9 +812,14 @@ impl VScalar for BlobToI32Scalar {
         let raw = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<i32>(n) };
             for i in 0..n {
+                if propagates_null && v0.row_is_null(i as u64) {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut s_raw = raw[i];
                 let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
                 let r = state.execute(&[FunctionValue::Binary(bytes)])
@@ -798,7 +866,14 @@ impl VScalar for BlobU32ToBlobScalar {
         let r0 = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let r1 = unsafe { v1.as_slice_with_len::<u32>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null
+                && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+            {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = r0[i];
             let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
             let r = state.execute(&[
@@ -839,7 +914,14 @@ impl VScalar for BlobI32ToBlobScalar {
         let r0 = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let r1 = unsafe { v1.as_slice_with_len::<i32>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null
+                && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+            {
+                out.set_null(i);
+                continue;
+            }
             let mut s_raw = r0[i];
             let bytes: Vec<u8> = DuckString::new(&mut s_raw).as_bytes().to_vec();
             let r = state.execute(&[
@@ -883,9 +965,18 @@ impl VScalar for BlobBlobF64ToBoolScalar {
         let r2 = unsafe { v2.as_slice_with_len::<f64>(n) };
         let mut out = output.flat_vector();
         let mut nulls: Vec<usize> = Vec::new();
+        let propagates_null = state.propagates_null();
         {
             let out_slice = unsafe { out.as_mut_slice_with_len::<bool>(n) };
             for i in 0..n {
+                if propagates_null
+                    && (v0.row_is_null(i as u64)
+                        || v1.row_is_null(i as u64)
+                        || v2.row_is_null(i as u64))
+                {
+                    nulls.push(i);
+                    continue;
+                }
                 let mut a = r0[i];
                 let mut b = r1[i];
                 let ab: Vec<u8> = DuckString::new(&mut a).as_bytes().to_vec();
@@ -942,7 +1033,14 @@ impl VScalar for BlobTextToBlobScalar {
         let r0 = unsafe { v0.as_slice_with_len::<duckdb_string_t>(n) };
         let r1 = unsafe { v1.as_slice_with_len::<duckdb_string_t>(n) };
         let mut out = output.flat_vector();
+        let propagates_null = state.propagates_null();
         for i in 0..n {
+            if propagates_null
+                && (v0.row_is_null(i as u64) || v1.row_is_null(i as u64))
+            {
+                out.set_null(i);
+                continue;
+            }
             let mut a = r0[i];
             let mut b = r1[i];
             let bytes: Vec<u8> = DuckString::new(&mut a).as_bytes().to_vec();
