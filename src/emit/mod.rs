@@ -3541,11 +3541,24 @@ r##"//! Spatial index registration.
 }
 
 pub fn readme(plan: &BridgePlan) -> String {
+    let primary = primary_extension_name(plan);
+    let crate_name = sanitize_crate_name(&primary);
+    let shim_env = format!("{}_SHIM_WASM", primary.to_uppercase().replace('-', "_"));
+    let lib_name = format!("lib{}_duckdb_bridge.dylib", crate_name.replace('-', "_"));
+    let ext_name = format!("{crate_name}_duckdb_bridge.duckdb_extension");
+
     let mut s = String::new();
-    s.push_str("# Generated DuckDB bridge\n\n");
-    s.push_str("This crate was produced by `ducklink-shim-codegen`. Do not\n");
-    s.push_str("edit by hand — regenerate from the source `.sqlite`.\n\n");
-    s.push_str("## Extensions wrapped\n\n");
+    s.push_str(&format!("# {primary}-duckdb-bridge\n\n"));
+    s.push_str(&format!(
+        "Generated DuckDB loadable extension that bridges the **{primary}** DataFission \
+         wasm shim into DuckDB as native scalar functions, aggregates, UDTFs, custom \
+         column types, and identity casts.\n\n"
+    ));
+    s.push_str("Produced by [`ducklink-shim-codegen`](https://github.com/zacharywhitley/ducklink-shim-codegen) \
+                from a shim-interface SQLite database. **Do not edit by hand** — regenerate \
+                from the source.\n\n");
+
+    s.push_str("## Surface\n\n");
     s.push_str(
         "| Extension | Version | Scalars | Aggregates | UDTFs | Windows | Types | \
          Operators | Casts | Preprocessors | Catalog | Indexes |\n",
@@ -3567,6 +3580,89 @@ pub fn readme(plan: &BridgePlan) -> String {
             e.spatial_indexes.len(),
         ));
     }
+
+    s.push_str(&format!(
+r##"
+## Build
+
+```sh
+cargo build --release
+```
+
+The build needs sibling checkouts of the path-dep'd workspace
+crates (`datafission-df-plugin-loader`, `datafission-df-plugin-api`,
+`datafission-functions`) at `../datafission/crates/`.
+
+## Package as a loadable extension
+
+DuckDB only loads files ending in `.duckdb_extension` that carry
+a metadata footer matching the target DuckDB version. The
+[`extension-template-rs`](https://github.com/duckdb/extension-template-rs)
+project ships a helper script for this:
+
+```sh
+python3 path/to/append_extension_metadata.py \
+  -l target/release/{lib_name} \
+  -n {crate_name}_duckdb_bridge \
+  -p osx_arm64 \
+  -dv v1.2.0 \
+  -ev v0.1.0 \
+  -o {ext_name} \
+  --abi-type C_STRUCT
+```
+
+Adjust `-p` to your platform (`linux_amd64`, `linux_arm64`,
+`osx_amd64`, …). Pin `-dv` to the DuckDB version you target.
+
+## Load + use
+
+The bridge needs the composed shim wasm at runtime; set
+`{shim_env}` before `LOAD`:
+
+```sql
+-- Need DuckDB CLI with -unsigned since we don't sign the bridge.
+{shim_env}=/path/to/{primary}-composed.wasm duckdb -unsigned
+> LOAD '/path/to/{ext_name}';
+```
+
+## Regen
+
+When the upstream shim's SQL surface changes:
+
+```sh
+cd ~/git/ducklink-shim-codegen
+cargo run --release -- \
+  --interface /path/to/{primary}-interface.sqlite \
+  --out ~/git/{primary}-duckdb-bridge
+```
+
+The codegen pipes every emitted `.rs` through
+`rustfmt --edition 2021`, so the resulting crate is
+`cargo fmt -p {crate_name}-duckdb-bridge -- --check`-clean by
+construction.
+
+## Architecture
+
+- Scalars: dispatched through duckdb-rs's `VScalar` trait
+  (vectorised; one chunk per invoke).
+- Aggregates + custom types + identity casts: raw
+  `libduckdb-sys` FFI — duckdb-rs doesn't surface these in its
+  safe wrapper.
+- Entrypoint: hand-rolled `extern "C"` symbol named
+  `{crate_name}_duckdb_bridge_init_c_api` (NOT the
+  `#[duckdb_entrypoint_c_api]` macro) so we can pull both a raw
+  `duckdb_connection` AND a `Connection` wrapper.
+- Custom types like `GEOMETRY` / `STBOX` register as BLOB
+  aliases; identity casts in both directions let
+  `CREATE TABLE t (g GEOMETRY); INSERT INTO t VALUES
+  (st_geomfromtext(...))` round-trip.
+
+## License
+
+Apache-2.0. Generated source so the same license as the
+codegen.
+"##,
+    ));
     s
 }
 
