@@ -1823,18 +1823,44 @@ pub fn operators_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Operator handling.
 //!
-//! DuckDB supports binary operators on custom types if there's
-//! a registered scalar function with the right signature, but
-//! the operator-name → function mapping is a per-binding
-//! detail. The clean path is: register each `op_<symbol>` as a
-//! plain scalar (already done in scalars.rs); document for users
-//! that they should call the function form, OR run their SQL
-//! through ducklink's preprocessor which rewrites
-//! `a && b` → `op_and(a, b)`.
+//! ## Phase 4d — same architectural blocker as sqlink
+//! (2026-06-24)
+//!
+//! DuckDB's parser tokenises operators at compile time too.
+//! Custom symbols like `&&&` or `<#>` are unrecognised tokens
+//! — `SELECT g1 &&& g2` is a parse error before any function
+//! dispatch could intervene. DuckDB DOES recognise some
+//! symbols (`<<`, `>>`, etc.) and could in principle bind them
+//! to scalar functions, but the registration API isn't exposed
+//! from duckdb-rs (same Connection-internals problem).
+//!
+//! ## Where this work actually lives
+//!
+//! SQL-preprocessing concern, not extension concern. The
+//! proper home is a separate `ducklink-preprocess` crate that:
+//!
+//!   - Parses SQL via sqlparser-rs (DuckDB dialect)
+//!   - Rewrites operators: `g1 && g2` → `st_bboxintersects(g1, g2)`
+//!   - Rewrites casts to user-types: same approach
+//!   - Hands rewritten SQL to duckdb-rs's `prepare`/`execute`
+//!
+//! That crate can be generated from the same BridgePlan but
+//! is a separate target.
+
+use duckdb::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Operators the shim advertises.
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for op in &ext.operators {
             s.push_str(&format!(
                 "// `{}` (lhs={:?}, rhs={:?})  →  {}\n",
@@ -1842,30 +1868,42 @@ r##"//! Operator handling.
             ));
         }
     }
-    s.push_str("\n// TODO: build operator rewrite table for ducklink preprocessor.\n");
     s
 }
 
 pub fn casts_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! CAST(x AS T) — DuckDB has CAST hooks for USER types.
+r##"//! CAST(x AS T) — DuckDB has cast hooks for USER types.
 //!
-//!   con.register_cast_function::<MyCast>(
-//!     LogicalType::Varchar,                 // source
-//!     LogicalType::user("GEOMETRY"),        // target
-//!     CastFunction::new(cast_fn)
-//!   )?;
+//! ## Phase 4d — partially blocked
 //!
-//! This is cleaner than SQLite — we don't need a preprocessor
-//! for casts at all if `source_kind == "any"`. The other source
-//! kinds (`stringliteral`, `geographycolumn`) still need
-//! preprocessor help because DuckDB casts are type-driven, not
-//! source-shape-driven.
+//! For `source_kind == "any"` casts, DuckDB exposes
+//! register_cast_function — but routing INTO it requires the
+//! same private `Connection.db` we're blocked on for
+//! aggregates (Phase 3c) and custom types (Phase 4b). Both
+//! prerequisites would unblock this together.
+//!
+//! For `source_kind == "stringliteral"` and `"geographycolumn"`,
+//! the rewrite is source-shape-driven (look at the expression
+//! shape, not the type) — DuckDB's CAST hooks are type-driven,
+//! so even when the API ships, these rewrites need to go to
+//! the `ducklink-preprocess` crate instead.
+
+use duckdb::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Cast rewrites the shim advertises.
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for c in &ext.cast_rewrites {
             s.push_str(&format!(
                 "// CAST(<{}> AS {}) → {} (hint: {})\n",
@@ -1873,22 +1911,33 @@ r##"//! CAST(x AS T) — DuckDB has CAST hooks for USER types.
             ));
         }
     }
-    s.push_str("\n// TODO: emit register_cast_function calls for `any`-kind;\n\
-                 //       defer non-`any` kinds to ducklink preprocessor.\n");
     s
 }
 
 pub fn preprocessors_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
-    s.push_str(r##"//! Token-level preprocessor patterns (shim-advertised).
+    s.push_str(
+r##"//! Token-level preprocessor patterns.
+//!
+//! ## Phase 4d — see operators.rs for the architectural picture.
+
+use duckdb::{Connection, Result};
+
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Preprocessor patterns the shim advertises.
+// ----------------------------------------------------------------------
 
 "##);
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for p in &ext.preprocessor_patterns {
             s.push_str(&format!("// token `{}` → {}\n", p.op_token, p.function_name));
         }
     }
-    s.push_str("\n// TODO: feed into ducklink preprocessor.\n");
     s
 }
 
