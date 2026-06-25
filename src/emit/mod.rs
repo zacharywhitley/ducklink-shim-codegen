@@ -7409,14 +7409,25 @@ pub unsafe fn register_all(conn: duckdb_connection) {
     let mut alias_count = 0usize;
     for ext in &plan.extensions {
         for agg in &ext.aggregates {
+            // Read the recorded input type from the first param
+            // signature; default to "binary" if absent. The shim's
+            // F64 aggregates (tfloat_max_agg / tfloat_stddev_agg /
+            // etc.) take a scalar f64, not a sequence blob; without
+            // threading this through we'd register them as
+            // (BLOB)->BLOB and the bridge would error at call time
+            // with `accumulator/value type mismatch`.
+            let in_ty = agg.param_signatures.first()
+                .and_then(|sig| sig.first())
+                .map(|t| t.as_str())
+                .unwrap_or("binary");
             s.push_str(&format!(
-                "    register_aggregate(conn, \"{name}\");\n",
-                name = agg.canonical_name,
+                "    register_aggregate(conn, \"{name}\", {in_ty:?});\n",
+                name = agg.canonical_name, in_ty = in_ty,
             ));
             for alias in &agg.aliases {
                 s.push_str(&format!(
-                    "    register_aggregate(conn, \"{alias}\"); // alias of {name}\n",
-                    alias = alias, name = agg.canonical_name,
+                    "    register_aggregate(conn, \"{alias}\", {in_ty:?}); // alias of {name}\n",
+                    alias = alias, name = agg.canonical_name, in_ty = in_ty,
                 ));
                 alias_count += 1;
             }
@@ -7433,7 +7444,7 @@ pub unsafe fn register_all(conn: duckdb_connection) {
     s.push_str(
 r##"}
 
-unsafe fn register_aggregate(conn: duckdb_connection, sql_name: &str) {
+unsafe fn register_aggregate(conn: duckdb_connection, sql_name: &str, input_ty: &str) {
     let def = match registry::lookup_aggregate(sql_name) {
         Some(d) => d,
         None => {
@@ -7453,19 +7464,35 @@ unsafe fn register_aggregate(conn: duckdb_connection, sql_name: &str) {
     };
     duckdb_aggregate_function_set_name(agg, name_cs.as_ptr());
 
-    // PostGIS aggregates are unary (ST_Union, ST_Extent,
-    // ST_Collect — all take one geometry blob). For multi-arg
-    // future aggregates, walk def.param_types() and call
-    // add_parameter per type. Today's flat BLOB signature is
-    // shape-correct for every shim aggregate observed.
-    let blob = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
-    duckdb_aggregate_function_add_parameter(agg, blob);
-    duckdb_aggregate_function_set_return_type(agg, blob);
+    // Input type from the shim's recorded param signature; most
+    // postgis aggregates are unary blob (ST_Union, ST_Extent, ...)
+    // but the mobilitydb F64 aggregates (tfloat_max_agg / etc.)
+    // take a scalar f64. Return type stays BLOB by default — the
+    // dispatch path converts every scalar result to bytes; users
+    // who want the typed value can wrap with `tfloat_to_text` or
+    // similar.
+    let in_id = match input_ty {
+        "float64" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+        "float32" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
+        "int64"   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+        "int32"   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER,
+        "uint64"  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT,
+        "uint32"  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
+        "boolean" => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+        "text"    => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        _         => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+    };
+    let in_lt = ffi::duckdb_create_logical_type(in_id);
+    duckdb_aggregate_function_add_parameter(agg, in_lt);
+    let ret_lt = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_set_return_type(agg, ret_lt);
     // Both add_parameter and set_return_type take the type by
     // value and DuckDB clones it internally, so we still own
-    // `blob` and have to destroy it after use.
-    let mut blob_to_destroy = blob;
-    ffi::duckdb_destroy_logical_type(&mut blob_to_destroy);
+    // the handles and must destroy them after use.
+    let mut in_to_destroy = in_lt;
+    ffi::duckdb_destroy_logical_type(&mut in_to_destroy);
+    let mut ret_to_destroy = ret_lt;
+    ffi::duckdb_destroy_logical_type(&mut ret_to_destroy);
 
         // Wire the callbacks (state_size + state_init + update +
         // combine + finalize). state_destroy goes through the
@@ -7560,27 +7587,79 @@ unsafe extern "C" fn update_callback(
 }
 
 unsafe fn update_inner(
-    _info: duckdb_function_info,
+    info: duckdb_function_info,
     input: duckdb_data_chunk,
     states: *mut duckdb_aggregate_state,
 ) -> std::result::Result<(), String> {
+    use datafission_functions::DataType;
     let n = ffi::duckdb_data_chunk_get_size(input) as usize;
     let v0 = ffi::duckdb_data_chunk_get_vector(input, 0);
-    let data = ffi::duckdb_vector_get_data(v0) as *const duckdb_string_t;
     let validity = ffi::duckdb_vector_get_validity(v0);
 
-    for i in 0..n {
-        if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as idx_t) {
-            // SQL aggregates skip NULLs unless they're COUNT(*) —
-            // PostGIS aggregates all skip NULL.
-            continue;
+    // Dispatch on the recorded input type. The aggregate's
+    // ExtraInfo wraps `Arc<dyn AggregateFunctionDef>`; we read
+    // its first parameter type to decide how to interpret the
+    // vector's raw memory.
+    let extra = extra_info_typed(info);
+    let in_ty = extra.def.param_types()
+        .first()
+        .and_then(|sig| sig.first().cloned())
+        .unwrap_or(DataType::Binary);
+
+    macro_rules! prim_loop {
+        ($ty:ty, $variant:ident) => {{
+            let data = ffi::duckdb_vector_get_data(v0) as *const $ty;
+            for i in 0..n {
+                if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as idx_t) {
+                    continue;
+                }
+                let val = std::ptr::read(data.add(i));
+                let acc_ptr = read_state(states, i);
+                let acc = &mut *acc_ptr;
+                acc.accumulate(&FunctionValue::$variant(val))
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+        }};
+    }
+
+    match in_ty {
+        DataType::Float64 => prim_loop!(f64, Float64),
+        DataType::Float32 => prim_loop!(f32, Float32),
+        DataType::Int64   => prim_loop!(i64, Int64),
+        DataType::Int32   => prim_loop!(i32, Int32),
+        DataType::UInt64  => prim_loop!(u64, UInt64),
+        DataType::UInt32  => prim_loop!(u32, UInt32),
+        DataType::Boolean => prim_loop!(bool, Boolean),
+        DataType::Text => {
+            let data = ffi::duckdb_vector_get_data(v0) as *const duckdb_string_t;
+            for i in 0..n {
+                if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as idx_t) {
+                    continue;
+                }
+                let mut s_raw: duckdb_string_t = std::ptr::read(data.add(i));
+                let bytes = read_string_t_bytes(&mut s_raw);
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let acc_ptr = read_state(states, i);
+                let acc = &mut *acc_ptr;
+                acc.accumulate(&FunctionValue::String(s))
+                    .map_err(|e| format!("{e:?}"))?;
+            }
         }
-        let mut s_raw: duckdb_string_t = std::ptr::read(data.add(i));
-        let bytes = read_string_t_bytes(&mut s_raw);
-        let acc_ptr = read_state(states, i);
-        let acc = &mut *acc_ptr;
-        acc.accumulate(&FunctionValue::Binary(bytes))
-            .map_err(|e| format!("{e:?}"))?;
+        _ => {
+            // Default: Binary/Blob — original path.
+            let data = ffi::duckdb_vector_get_data(v0) as *const duckdb_string_t;
+            for i in 0..n {
+                if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, i as idx_t) {
+                    continue;
+                }
+                let mut s_raw: duckdb_string_t = std::ptr::read(data.add(i));
+                let bytes = read_string_t_bytes(&mut s_raw);
+                let acc_ptr = read_state(states, i);
+                let acc = &mut *acc_ptr;
+                acc.accumulate(&FunctionValue::Binary(bytes))
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -7652,9 +7731,21 @@ unsafe fn finalize_inner(
         }
         let acc = &**acc_ptr;
         let value = acc.finalize().map_err(|e| format!("{e:?}"))?;
+        // Output type is BLOB by construction (aggregates_rs sets the
+        // return type to LogicalTypeId::Blob unconditionally). Encode
+        // primitives as their little-endian bytes — callers that want
+        // the typed value can apply `octet_length()` to confirm width
+        // or unhex back to a primitive via DuckDB's bit ops.
         match value {
-            FunctionValue::Binary(b) => vector_assign_bytes(result, dst, &b),
-            FunctionValue::String(s) => vector_assign_bytes(result, dst, s.as_bytes()),
+            FunctionValue::Binary(b)  => vector_assign_bytes(result, dst, &b),
+            FunctionValue::String(s)  => vector_assign_bytes(result, dst, s.as_bytes()),
+            FunctionValue::Float64(v) => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::Float32(v) => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::Int64(v)   => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::Int32(v)   => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::UInt64(v)  => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::UInt32(v)  => vector_assign_bytes(result, dst, &v.to_le_bytes()),
+            FunctionValue::Boolean(v) => vector_assign_bytes(result, dst, &[v as u8]),
             FunctionValue::Null => vector_set_null(result, dst),
             other => return Err(format!(
                 "aggregate finalize: unexpected result variant `{}`",
