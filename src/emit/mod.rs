@@ -274,32 +274,44 @@ pub fn register_all(conn: &Connection) -> Result<()> {
 
     for ext in &plan.extensions {
         for sc in &ext.scalars {
-            let shape = classify_shape(sc);
-            match shape {
-                Some(helper) => {
-                    s.push_str(&format!(
-                        "    if let Err(e) = {helper}(conn, \"{name}\") {{ \
-                         eprintln!(\"[shim-scalars] skipping `{name}`: {{e}}\"); }}\n",
-                        helper = helper, name = sc.canonical_name,
-                    ));
-                    for alias in &sc.aliases {
+            // Phase 4j: iterate every signature overload, not
+            // just the first. DuckDB's C API supports
+            // overload registration (same name, multiple
+            // parameter lists); registering each overload
+            // independently lets st_addface(a, b) AND
+            // st_addface(a, b, true) both dispatch correctly.
+            let mut any_covered = false;
+            for params in &sc.param_signatures {
+                let shape = classify_shape_for(params, &sc.return_type);
+                match shape {
+                    Some(helper) => {
+                        any_covered = true;
                         s.push_str(&format!(
-                            "    if let Err(e) = {helper}(conn, \"{alias}\") {{ \
-                             eprintln!(\"[shim-scalars] skipping `{alias}`: {{e}}\"); }} \
-                             // alias of {name}\n",
-                            helper = helper, alias = alias, name = sc.canonical_name,
+                            "    if let Err(e) = {helper}(conn, \"{name}\") {{ \
+                             eprintln!(\"[shim-scalars] skipping `{name}`: {{e}}\"); }}\n",
+                            helper = helper, name = sc.canonical_name,
                         ));
+                        for alias in &sc.aliases {
+                            s.push_str(&format!(
+                                "    if let Err(e) = {helper}(conn, \"{alias}\") {{ \
+                                 eprintln!(\"[shim-scalars] skipping `{alias}`: {{e}}\"); }} \
+                                 // alias of {name}\n",
+                                helper = helper, alias = alias, name = sc.canonical_name,
+                            ));
+                        }
+                        *emitted.entry(helper).or_insert(0) += 1 + sc.aliases.len();
                     }
-                    *emitted.entry(helper).or_insert(0) += 1 + sc.aliases.len();
-                }
-                None => {
-                    let v = sc.param_signatures.first()
-                        .map(|v| v.iter().cloned().collect::<Vec<_>>().join(","))
-                        .unwrap_or_else(|| "".into());
-                    let key = format!("[{v}] -> {ret}", ret = sc.return_type);
-                    *skipped.entry(key).or_insert(0) += 1;
+                    None => {
+                        let v = params.iter().cloned().collect::<Vec<_>>().join(",");
+                        let key = format!("[{v}] -> {ret}", ret = sc.return_type);
+                        *skipped.entry(key).or_insert(0) += 1;
+                    }
                 }
             }
+            // If the scalar has zero param_signatures (shouldn't
+            // happen post-shim-fix but defensive), don't double-
+            // count it as skipped.
+            let _ = any_covered;
         }
     }
 
@@ -328,13 +340,21 @@ pub fn register_all(conn: &Connection) -> Result<()> {
     s
 }
 
-/// Map a scalar's `param_signatures[0]` + return_type pair to a
-/// Phase-2 shape helper name. Returns None when the shape isn't
-/// covered (caller emits as a comment for Phase 3).
+/// Backward-compat: classify the FIRST overload of a scalar.
+/// Per-overload code (Phase 4j) calls `classify_shape_for`
+/// directly.
+#[allow(dead_code)]
 fn classify_shape(sc: &shim_bridge_codegen_core::ScalarFn) -> Option<&'static str> {
     let v = sc.param_signatures.first()?;
-    let pat: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
-    let ret = sc.return_type.as_str();
+    classify_shape_for(v, &sc.return_type)
+}
+
+/// Per-(params, return_type) shape lookup. Returns None when
+/// the shape isn't covered (caller emits as a comment for
+/// future Phase work).
+fn classify_shape_for(params: &[String], return_type: &str) -> Option<&'static str> {
+    let pat: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+    let ret = return_type;
     match (pat.as_slice(), ret) {
         (["text"], "binary")                 => Some("register_text_to_blob"),
         (["binary"], "binary")               => Some("register_blob_to_blob"),
