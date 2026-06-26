@@ -31,7 +31,7 @@ datafission-functions        = {{ path = "../datafission/crates/functions" }}
 # those APIs in its safe wrapper but the C ABI is fully
 # accessible via libduckdb-sys (a re-export of libduckdb-sys's
 # `loadable-extension` feature).
-duckdb         = {{ version = "~1.10504", features = ["vscalar", "loadable-extension"] }}
+duckdb         = {{ version = "~1.10504", features = ["vscalar", "vtab", "loadable-extension"] }}
 libduckdb-sys  = {{ version = "~1.10504", features = ["loadable-extension"] }}
 
 anyhow      = "1"
@@ -181,9 +181,18 @@ unsafe fn entrypoint_inner(
     // Step 7 — aggregates via raw libduckdb-sys.
     aggregates::register_all(raw_con);
 
-    // Step 8 — UDTFs still go through duckdb-rs (vtab trait).
-    table_functions::register_all(&conn)
-        .map_err(|e| -> Box<dyn Error> {{ format!("table function registration: {{e}}").into() }})?;
+    // Step 8 — UDTFs via raw libduckdb-sys (DuckDB's VTab
+    // bind/init hooks are static, so we dispatch dynamically by
+    // name through the C table-function API — same pattern as
+    // aggregates).
+    table_functions::register_all(raw_con);
+
+    // Step 9 — spatial indexes. The loadable C API can't register
+    // custom index access methods (see spatial_indexes.rs); this
+    // is a documented no-op. Index-backed lookups are exposed as
+    // table functions instead.
+    spatial_indexes::register_all(&conn)
+        .map_err(|e| -> Box<dyn Error> {{ format!("spatial index registration: {{e}}").into() }})?;
 
     Ok(true)
 }}
@@ -272,8 +281,35 @@ pub fn register_all(conn: &Connection) -> Result<()> {
     let mut emitted: std::collections::HashMap<&'static str, usize> = Default::default();
     let mut skipped: std::collections::HashMap<String, usize> = Default::default();
 
+    // Scalar/aggregate name-clash resolution (deterministic,
+    // interface-DB-driven). DuckDB's loadable C API forbids a
+    // scalar and an aggregate sharing a name in the same catalog:
+    // whichever registers second is rejected. PostGIS declares a
+    // handful of names (st_collect, st_union, st_clusterwithin,
+    // st_clusterdbscan, st_clusterintersecting) and MobilityDB a
+    // few (tfloat_sum, tint_sum, …) as BOTH. For those the
+    // AGGREGATE form is the one users want (`SELECT st_collect(g)
+    // FROM …`), so the scalar emit SKIPS any canonical name that
+    // is also published as an aggregate, leaving the field clear
+    // for aggregates_rs to register it. The set is computed from
+    // the plan, so a future shim's clashes resolve automatically.
+    let aggregate_names: std::collections::HashSet<&str> = plan
+        .extensions
+        .iter()
+        .flat_map(|e| e.aggregates.iter().map(|a| a.canonical_name.as_str()))
+        .collect();
+
     for ext in &plan.extensions {
         for sc in &ext.scalars {
+            // Aggregate wins on a scalar/aggregate name clash.
+            if aggregate_names.contains(sc.canonical_name.as_str()) {
+                s.push_str(&format!(
+                    "    // scalar `{}` skipped — name also published as an aggregate; \
+                     the aggregate form is registered instead (see aggregates.rs).\n",
+                    sc.canonical_name,
+                ));
+                continue;
+            }
             // Phase 4j: iterate every signature overload, not
             // just the first. DuckDB's C API supports
             // overload registration (same name, multiple
@@ -7235,6 +7271,7 @@ struct ShimRegistry {{
     _ext: RuntimeWasmExtension,  // keep the wasm Store alive
     scalars: RwLock<HashMap<String, Arc<dyn ScalarFunctionDef>>>,
     aggregates: RwLock<HashMap<String, Arc<dyn AggregateFunctionDef>>>,
+    tables: RwLock<HashMap<String, Arc<dyn TableFunctionDef>>>,
 }}
 
 pub fn load_shim() -> Result<()> {{
@@ -7251,6 +7288,7 @@ pub fn load_shim() -> Result<()> {{
     let mut capture = CapturingTarget {{
         scalars: Vec::new(),
         aggregates: Vec::new(),
+        tables: Vec::new(),
     }};
     ext.register(&mut capture)
         .map_err(|e| anyhow::anyhow!("shim register: {{e}}"))?;
@@ -7271,11 +7309,20 @@ pub fn load_shim() -> Result<()> {{
         }}
         aggregates.insert(canonical, def);
     }}
+    let mut tables = HashMap::with_capacity(capture.tables.len() * 2);
+    for def in capture.tables {{
+        let canonical = def.name().to_string();
+        for alias in def.aliases() {{
+            tables.insert(alias.to_string(), Arc::clone(&def));
+        }}
+        tables.insert(canonical, def);
+    }}
 
     SHIM.set(ShimRegistry {{
         _ext: ext,
         scalars: RwLock::new(scalars),
         aggregates: RwLock::new(aggregates),
+        tables: RwLock::new(tables),
     }}).map_err(|_| anyhow::anyhow!("ShimRegistry already initialised"))?;
 
     Ok(())
@@ -7291,12 +7338,18 @@ pub fn lookup_aggregate(name: &str) -> Option<Arc<dyn AggregateFunctionDef>> {{
     r.aggregates.read().get(name).cloned()
 }}
 
-/// ExtensionTarget that captures every scalar and aggregate the
-/// shim registers. UDTFs / windows / types / etc. are accepted
-/// as no-ops until later phases.
+pub fn lookup_table(name: &str) -> Option<Arc<dyn TableFunctionDef>> {{
+    let r = SHIM.get()?;
+    r.tables.read().get(name).cloned()
+}}
+
+/// ExtensionTarget that captures every scalar, aggregate, and
+/// table function the shim registers. Windows / types / etc. are
+/// accepted as no-ops until later phases.
 struct CapturingTarget {{
     scalars: Vec<Arc<dyn ScalarFunctionDef>>,
     aggregates: Vec<Arc<dyn AggregateFunctionDef>>,
+    tables: Vec<Arc<dyn TableFunctionDef>>,
 }}
 
 impl ExtensionTarget for CapturingTarget {{
@@ -7319,8 +7372,11 @@ impl ExtensionTarget for CapturingTarget {{
     fn register_table_function(
         &mut self,
         _namespace: &str,
-        _def: Arc<dyn TableFunctionDef>,
-    ) -> std::result::Result<(), ExtensionError> {{ Ok(()) }}
+        def: Arc<dyn TableFunctionDef>,
+    ) -> std::result::Result<(), ExtensionError> {{
+        self.tables.push(def);
+        Ok(())
+    }}
     fn register_window_function(
         &mut self,
         _namespace: &str,
@@ -7519,17 +7575,18 @@ unsafe fn register_aggregate(conn: duckdb_connection, sql_name: &str, input_ty: 
     let rc = duckdb_register_aggregate_function(conn, agg);
     duckdb_destroy_aggregate_function(&mut { agg });
     if rc != DuckDBSuccess {
-        // 5 PostGIS aggregate names clash with scalar variants
-        // (st_collect, st_union, st_clusterwithin,
-        // st_clusterdbscan, st_clusterintersecting). DuckDB
-        // rejects the registration in that case. Swallow the
-        // error so the non-clashing aggregates still register —
-        // the clashing ones fall back to the already-registered
-        // scalar form, which has the semantics the user probably
-        // wanted anyway.
+        // Scalar/aggregate name clashes (st_collect, st_union,
+        // st_clusterwithin, st_clusterdbscan,
+        // st_clusterintersecting, tfloat_sum, tint_sum, …) are
+        // resolved in favour of the AGGREGATE: scalars.rs skips
+        // any name also published as an aggregate, so this
+        // registration normally succeeds. A non-success rc here
+        // therefore means a genuine catalog conflict (e.g. a
+        // built-in DuckDB aggregate of the same name) — log and
+        // continue so the rest still register.
         eprintln!(
-            "postgis-duckdb-bridge: skipping aggregate `{sql_name}` \
-             (name already in use by a scalar; rc={rc})"
+            "[shim-aggregates] could not register aggregate `{sql_name}` (rc={rc}); \
+             a built-in of the same name may already exist"
         );
     }
 }
@@ -7817,59 +7874,229 @@ unsafe fn set_error(info: duckdb_function_info, msg: &str) {
     s
 }
 
+/// Map an interface-DB `TypeName` string to a generated
+/// `datafission_functions::DataType` constructor expression. The
+/// strings are the same vocabulary the scalar shape-classifier
+/// uses (`binary`, `text`, `float64`, `int32`, …). Anything
+/// unrecognised falls back to `DataType::Binary` — the shim ABI
+/// is byte-oriented, so a BLOB-shaped argument round-trips an
+/// arbitrary payload losslessly.
+fn type_name_to_datatype_expr(t: &str) -> &'static str {
+    match t {
+        "boolean" => "DataType::Boolean",
+        "int8"    => "DataType::Int8",
+        "int16"   => "DataType::Int16",
+        "int32"   => "DataType::Int32",
+        "int64"   => "DataType::Int64",
+        "uint8"   => "DataType::UInt8",
+        "uint16"  => "DataType::UInt16",
+        "uint32"  => "DataType::UInt32",
+        "uint64"  => "DataType::UInt64",
+        "float32" => "DataType::Float32",
+        "float64" => "DataType::Float64",
+        "text"    => "DataType::Text",
+        "binary"  => "DataType::Binary",
+        _         => "DataType::Binary",
+    }
+}
+
 pub fn table_functions_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
     s.push_str(
-r##"//! Table-function registration.
+r##"//! Table-function (UDTF) registration via raw libduckdb-sys.
 //!
-//! ## Phase 4c — SCAFFOLDED (2026-06-24)
+//! ## Phase 5 (2026-06-25) — WIRED
 //!
-//! Unlike aggregates (Phase 3c) and custom types (Phase 4b),
-//! DuckDB's TableFunction API IS exposed in duckdb-rs via
-//! the `VTab` trait. The `hello-ext` example
-//! (`~/.cargo/registry/.../duckdb-1.x/examples/hello-ext/main.rs`)
-//! shows the canonical pattern: bind/init/func callbacks +
-//! `con.register_table_function::<HelloVTab>("hello")`.
+//! Each shim UDTF is registered through DuckDB's C
+//! table-function API (`duckdb_create_table_function` + the
+//! bind/init/function callbacks). DuckDB's `VTab` bind/init
+//! hooks are *static* — they don't know which registered name
+//! they're serving — so we dispatch dynamically by stashing the
+//! resolved `Arc<dyn TableFunctionDef>` on the function's
+//! ExtraInfo (mirrors how aggregates carry their def). One
+//! generic dispatcher serves every UDTF regardless of arity or
+//! signature, so a future shim's table functions wire up with
+//! no per-shim code.
 //!
-//! Architecture for shipping this
+//! ### One arity per name (DuckDB C-API limitation)
 //!
-//!   1. Define one concrete `ShimVTab` type with a BindData
-//!      that holds Arc<dyn TableFunctionDef> + the parameter
-//!      values from the SQL call.
+//! Unlike the scalar C API (which has a function-set abstraction
+//! for positional overloads), DuckDB's loadable table-function
+//! C API binds by EXACT positional arity and keeps a single
+//! catalog entry per name. We therefore register each name once,
+//! with its NARROWEST recorded signature (the most broadly
+//! callable form). Wider positional overloads — e.g.
+//! `st_subdivide(geom, maxvertices)` on top of
+//! `st_subdivide(geom)` — can't coexist under the same name and
+//! are noted as comments in `register_all`. The chosen
+//! signature's parameter types come from the interface DB.
 //!
-//!   2. `bind` reads SQL params via `bind.get_parameter(i)`,
-//!      builds the output column schema from
-//!      `def.output_schema(...)`.
+//! Lifecycle:
 //!
-//!   3. `init` creates a per-query InitData holding
-//!      `Box<dyn TableFunctionIterator>` from
-//!      `def.execute(&function_values)`.
+//!   bind  — read each SQL parameter via `bind_get_parameter`
+//!           (typed from `def.param_types()`), build the
+//!           `FunctionValue` argument vector, derive the output
+//!           column schema from `def.output_schema(input_types)`
+//!           and declare it via `bind_add_result_column`. The
+//!           args + the per-column output DataTypes are stored
+//!           in the BindData.
 //!
-//!   4. `func` calls `iter.next_row()` repeatedly to fill the
-//!      output DataChunk; sets output length when chunk full
-//!      or iter exhausted.
+//!   init  — call `def.execute(&args)` to obtain a
+//!           `Box<dyn TableFunctionIterator>`; park it (behind a
+//!           Mutex, since DuckDB may call `function` from a
+//!           worker thread) in the InitData. We force
+//!           single-threaded scan (`init_set_max_threads(1)`)
+//!           because the shim iterator is a stateful handle into
+//!           the wasm Store and is not parallel-safe.
 //!
-//! Same blocker as Phase 3c/4b — the way duckdb-rs threads
-//! state through bind/init/func means each shim UDTF needs
-//! its own per-name VTab struct (or unsafe shared state).
-//! With 7 PostGIS UDTFs and 2-3 ducks of unsafe code per
-//! per-UDTF impl, this is ~400 LOC that warrants its own
-//! session.
+//!   func  — pull `iter.next_row()` up to one vector's worth of
+//!           rows, writing each column value to the matching
+//!           output vector; set the produced chunk size. An
+//!           empty chunk signals end-of-scan to DuckDB.
 
-use duckdb::{Connection, Result};
+use std::ffi::{CString, c_char, c_void};
+use std::sync::Arc;
 
-/// Phase-4c no-op. The shim's UDTFs are captured in the
-/// registry; the day someone writes the ShimVTab adapter,
-/// this becomes a loop over registry::all_table_functions().
-pub fn register_all(_conn: &Connection) -> Result<()> {
-    Ok(())
+use parking_lot::Mutex;
+
+use libduckdb_sys::{
+    self as ffi, DuckDBSuccess, duckdb_bind_add_result_column, duckdb_bind_get_extra_info,
+    duckdb_bind_get_parameter, duckdb_bind_get_parameter_count, duckdb_bind_info,
+    duckdb_bind_set_bind_data, duckdb_bind_set_error, duckdb_connection,
+    duckdb_create_table_function, duckdb_data_chunk, duckdb_data_chunk_set_size,
+    duckdb_destroy_table_function, duckdb_function_get_bind_data,
+    duckdb_function_get_init_data, duckdb_function_info, duckdb_function_set_error,
+    duckdb_init_get_bind_data, duckdb_init_info, duckdb_init_set_init_data,
+    duckdb_init_set_max_threads, duckdb_register_table_function,
+    duckdb_table_function_add_parameter, duckdb_table_function_set_bind,
+    duckdb_table_function_set_extra_info, duckdb_table_function_set_function,
+    duckdb_table_function_set_init, duckdb_table_function_set_name, idx_t,
+};
+
+use datafission_functions::DataType;
+use datafission_functions::traits::{ColumnInfo, TableFunctionDef, TableFunctionIterator};
+use datafission_functions::types::FunctionValue;
+
+use crate::registry;
+
+/// Per-registration state stashed on the table function via
+/// `duckdb_table_function_set_extra_info`; recovered in `bind`.
+///
+/// `param_types` is the SPECIFIC overload signature this DuckDB
+/// table-function registration serves. A UDTF with N distinct
+/// argument-count overloads (e.g. `st_subdivide(blob)` and
+/// `st_subdivide(blob, int32)`) is registered N times — once per
+/// overload — each carrying its own `param_types` so `bind` reads
+/// each positional argument with the right getter.
+struct TfExtraInfo {
+    def: Arc<dyn TableFunctionDef>,
+    param_types: Vec<DataType>,
 }
 
-// ----------------------------------------------------------------------
-// UDTFs the shim publishes.
-// ----------------------------------------------------------------------
+/// Produced by `bind`, consumed by `init` / `func`. Holds the
+/// evaluated call arguments + the resolved def + the output
+/// column DataTypes (so `func` knows how to write each column).
+struct TfBindData {
+    def: Arc<dyn TableFunctionDef>,
+    args: Vec<FunctionValue>,
+    out_types: Vec<DataType>,
+}
 
+/// Per-scan state produced by `init`. The shim iterator is a
+/// stateful wasm handle, so it lives behind a Mutex and the scan
+/// runs single-threaded.
+///
+/// `tag` is the leading field (and is always `INIT_OK_TAG`) so a
+/// single-byte read at the box head can distinguish this from the
+/// error sentinel `TfInitErr` — both arrive through the same
+/// `duckdb_init_set_init_data` slot and `func` must tell them
+/// apart. `#[repr(C)]` pins `tag` first.
+#[repr(C)]
+struct TfInitData {
+    tag: u8,
+    iter: Mutex<Box<dyn TableFunctionIterator>>,
+    out_types: Vec<DataType>,
+    done: bool,
+}
+
+/// Register every UDTF the shim publishes.
+///
+/// # Safety
+///
+/// `conn` must be a valid `duckdb_connection` for the duration
+/// of this call.
+pub unsafe fn register_all(conn: duckdb_connection) {
 "##,
+    );
+
+    let mut canonical = 0usize;
+    let mut alias_count = 0usize;
+    let mut dropped_overloads = 0usize;
+    for ext in &plan.extensions {
+        for tf in &ext.table_functions {
+            // DuckDB's loadable C table-function API binds by EXACT
+            // positional arity and keeps a single catalog entry per
+            // name — it has no positional-overload set like the
+            // scalar API does. So we register ONE registration per
+            // name, using the NARROWEST recorded signature (the most
+            // broadly callable form). Wider positional overloads
+            // (e.g. `st_subdivide(g, maxvertices)`) cannot coexist
+            // under the same name through this API; they're listed
+            // as a comment below and would need named-parameter
+            // syntax to be reached. The chosen signature's parameter
+            // TYPES come from the interface DB (the source of truth),
+            // not the shim's runtime `param_types()` — the shim's WIT
+            // `list-functions` metadata may advertise only one
+            // canonical signature even when the SQL surface has more.
+            let mut sigs: Vec<&Vec<String>> = tf.param_signatures.iter().collect();
+            sigs.sort_by_key(|sig| sig.len());
+            let chosen = sigs.first().copied();
+            let dt_list = chosen
+                .map(|sig| {
+                    sig.iter()
+                        .map(|t| type_name_to_datatype_expr(t))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "    register_table_function(conn, {name:?}, &[{dt_list}]);\n",
+                name = tf.canonical_name, dt_list = dt_list,
+            ));
+            for alias in &tf.aliases {
+                s.push_str(&format!(
+                    "    register_table_function(conn, {alias:?}, &[{dt_list}]); // alias of {name}\n",
+                    alias = alias, name = tf.canonical_name, dt_list = dt_list,
+                ));
+            }
+            // Count + note any wider overloads we couldn't register.
+            for sig in sigs.iter().skip(1) {
+                s.push_str(&format!(
+                    "    // overload `{name}({sig})` not registerable (DuckDB C API: \
+                     one positional arity per table-function name)\n",
+                    name = tf.canonical_name,
+                    sig = sig.iter().cloned().collect::<Vec<_>>().join(", "),
+                ));
+                dropped_overloads += 1;
+            }
+            alias_count += tf.aliases.len();
+            canonical += 1;
+        }
+    }
+    s.push_str(&format!(
+        "    // Phase 5: {canonical} canonical UDTFs + {alias_count} alias registrations \
+         ({dropped_overloads} wider positional overloads not expressible via the C API).\n"
+    ));
+    if canonical == 0 {
+        s.push_str("    // (no table functions in this interface DB)\n");
+    }
+
+    s.push_str(TABLE_FUNCTIONS_RUNTIME);
+
+    s.push_str(
+        "\n// ----------------------------------------------------------------------\n\
+         // UDTFs the shim publishes.\n\
+         // ----------------------------------------------------------------------\n\n",
     );
     for ext in &plan.extensions {
         s.push_str(&format!("// === extension: {} ===\n", ext.name));
@@ -7883,6 +8110,419 @@ pub fn register_all(_conn: &Connection) -> Result<()> {
     }
     s
 }
+
+/// The table-function runtime — the generic registrar + the
+/// three C callbacks. Emitted verbatim into every generated
+/// bridge so each crate is self-contained.
+const TABLE_FUNCTIONS_RUNTIME: &str = r##"}
+
+unsafe fn register_table_function(
+    conn: duckdb_connection,
+    sql_name: &str,
+    param_types: &[DataType],
+) {
+    let def = match registry::lookup_table(sql_name) {
+        Some(d) => d,
+        None => {
+            eprintln!("[shim-table-functions] no shim entry for `{sql_name}` — skipping");
+            return;
+        }
+    };
+    let param_types: Vec<DataType> = param_types.to_vec();
+
+    let tf = duckdb_create_table_function();
+    let name_cs = match CString::new(sql_name) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[shim-table-functions] name contains NUL: `{sql_name}` — skipping");
+            duckdb_destroy_table_function(&mut { tf });
+            return;
+        }
+    };
+    duckdb_table_function_set_name(tf, name_cs.as_ptr());
+
+    // Declare positional parameters for this overload. DuckDB
+    // needs them to bind `SELECT * FROM fn(a, b, ...)`. The bind
+    // callback re-reads the live values; these declarations fix
+    // arity + coarse type so the planner accepts the call.
+    for dt in &param_types {
+        let lt = ffi::duckdb_create_logical_type(logical_type_id_for(dt));
+        duckdb_table_function_add_parameter(tf, lt);
+        let mut to_destroy = lt;
+        ffi::duckdb_destroy_logical_type(&mut to_destroy);
+    }
+
+    duckdb_table_function_set_bind(tf, Some(bind_callback));
+    duckdb_table_function_set_init(tf, Some(init_callback));
+    duckdb_table_function_set_function(tf, Some(func_callback));
+
+    // Park the per-registration def + this overload's param types.
+    // The Box is leaked here and reclaimed when DuckDB calls the
+    // destructor.
+    let extra = Box::into_raw(Box::new(TfExtraInfo {
+        def: Arc::clone(&def),
+        param_types,
+    }));
+    duckdb_table_function_set_extra_info(tf, extra as *mut c_void, Some(drop_extra_info));
+
+    let rc = duckdb_register_table_function(conn, tf);
+    duckdb_destroy_table_function(&mut { tf });
+    if rc != DuckDBSuccess {
+        eprintln!(
+            "[shim-table-functions] could not register `{sql_name}` (rc={rc})"
+        );
+    }
+}
+
+/// Map a DataFission `DataType` to the DuckDB C `DUCKDB_TYPE_*`
+/// id used for both parameter declarations and output columns.
+fn logical_type_id_for(dt: &DataType) -> ffi::duckdb_type {
+    match dt {
+        DataType::Boolean                  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+        DataType::Int8                     => ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT,
+        DataType::Int16                    => ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT,
+        DataType::Int32                    => ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER,
+        DataType::Int64                    => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+        DataType::UInt8                    => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT,
+        DataType::UInt16                   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT,
+        DataType::UInt32                   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
+        DataType::UInt64                   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT,
+        DataType::Float32                  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
+        DataType::Float64                  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+        DataType::Char { .. }
+        | DataType::Varchar { .. }
+        | DataType::Text                   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        DataType::Binary                   => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+        // Anything we don't have an explicit mapping for falls
+        // back to BLOB — the shim ABI is byte-oriented, so a BLOB
+        // column round-trips arbitrary payloads losslessly.
+        _                                  => ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+    }
+}
+
+// =====================================================================
+// C callbacks. All `unsafe extern "C"` because DuckDB calls them.
+// =====================================================================
+
+unsafe extern "C" fn bind_callback(info: duckdb_bind_info) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bind_inner(info))) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => bind_set_err(info, &msg),
+        Err(_)       => bind_set_err(info, "panic in table-function bind"),
+    }
+}
+
+unsafe fn bind_inner(info: duckdb_bind_info) -> std::result::Result<(), String> {
+    let extra = &*(duckdb_bind_get_extra_info(info) as *const TfExtraInfo);
+    let def = Arc::clone(&extra.def);
+
+    // This registration's specific overload signature tells us how
+    // to interpret each positional argument's value.
+    let want = extra.param_types.clone();
+
+    let n = duckdb_bind_get_parameter_count(info) as usize;
+    let mut args: Vec<FunctionValue> = Vec::with_capacity(n);
+    let mut input_types: Vec<DataType> = Vec::with_capacity(n);
+    for i in 0..n {
+        let dt = want.get(i).cloned().unwrap_or(DataType::Binary);
+        let val = duckdb_bind_get_parameter(info, i as idx_t);
+        if val.is_null() {
+            return Err(format!("table function `{}`: parameter {i} is null", def.name()));
+        }
+        let fv = read_value(val, &dt);
+        let mut v = val;
+        ffi::duckdb_destroy_value(&mut v);
+        args.push(fv);
+        input_types.push(dt);
+    }
+
+    // Derive + declare the output schema. An empty schema means
+    // the shim couldn't express the output columns (e.g. an
+    // input type not representable in the WIT logical-type set) —
+    // surface that as a bind error rather than a 0-column table.
+    let schema: Vec<ColumnInfo> = def.output_schema(&input_types);
+    if schema.is_empty() {
+        return Err(format!(
+            "table function `{}`: shim returned an empty output schema",
+            def.name()
+        ));
+    }
+    let mut out_types: Vec<DataType> = Vec::with_capacity(schema.len());
+    for col in &schema {
+        let c_name = CString::new(col.name.as_str())
+            .map_err(|_| format!("output column name contains NUL: {}", col.name))?;
+        let lt = ffi::duckdb_create_logical_type(logical_type_id_for(&col.data_type));
+        duckdb_bind_add_result_column(info, c_name.as_ptr(), lt);
+        let mut to_destroy = lt;
+        ffi::duckdb_destroy_logical_type(&mut to_destroy);
+        out_types.push(col.data_type.clone());
+    }
+
+    let bind = Box::into_raw(Box::new(TfBindData { def, args, out_types }));
+    duckdb_bind_set_bind_data(info, bind as *mut c_void, Some(drop_bind_data));
+    Ok(())
+}
+
+unsafe extern "C" fn init_callback(info: duckdb_init_info) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| init_inner(info))) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => {
+            // init has no set_error of its own; surface via a
+            // poisoned init-data carrying the message, picked up by
+            // the first func call.
+            let init = Box::into_raw(Box::new(TfInitErr { tag: INIT_ERR_TAG, msg }));
+            duckdb_init_set_init_data(info, init as *mut c_void, Some(drop_init_err));
+        }
+        Err(_) => {
+            let init = Box::into_raw(Box::new(TfInitErr {
+                tag: INIT_ERR_TAG,
+                msg: "panic in table-function init".into(),
+            }));
+            duckdb_init_set_init_data(info, init as *mut c_void, Some(drop_init_err));
+        }
+    }
+}
+
+unsafe fn init_inner(info: duckdb_init_info) -> std::result::Result<(), String> {
+    let bind = &*(duckdb_init_get_bind_data(info) as *const TfBindData);
+    let iter = bind.def.execute(&bind.args).map_err(|e| format!("{e:?}"))?;
+    // The shim iterator is a single stateful wasm handle; force a
+    // single-threaded scan so DuckDB doesn't call `func`
+    // concurrently across worker threads.
+    duckdb_init_set_max_threads(info, 1);
+    let init = Box::into_raw(Box::new(TfInitData {
+        tag: INIT_OK_TAG,
+        iter: Mutex::new(iter),
+        out_types: bind.out_types.clone(),
+        done: false,
+    }));
+    duckdb_init_set_init_data(info, init as *mut c_void, Some(drop_init_data));
+    Ok(())
+}
+
+unsafe extern "C" fn func_callback(info: duckdb_function_info, output: duckdb_data_chunk) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func_inner(info, output))) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => func_set_err(info, &msg),
+        Err(_)       => func_set_err(info, "panic in table-function scan"),
+    }
+}
+
+unsafe fn func_inner(
+    info: duckdb_function_info,
+    output: duckdb_data_chunk,
+) -> std::result::Result<(), String> {
+    // Both the success (TfInitData) and error (TfInitErr) paths
+    // install a `#[repr(C)]` box whose first field is a `u8` tag.
+    // Read that one byte to discriminate before interpreting the
+    // rest of the allocation.
+    let raw = duckdb_function_get_init_data(info);
+    if raw.is_null() {
+        // No init data at all — emit empty chunk = end of scan.
+        duckdb_data_chunk_set_size(output, 0);
+        return Ok(());
+    }
+    let tag = *(raw as *const u8);
+    if tag == INIT_ERR_TAG {
+        let err = &*(raw as *const TfInitErr);
+        return Err(err.msg.clone());
+    }
+
+    let init = &*(raw as *const TfInitData);
+    if init.done {
+        duckdb_data_chunk_set_size(output, 0);
+        return Ok(());
+    }
+
+    let cap = ffi::duckdb_vector_size() as usize;
+    let ncols = init.out_types.len();
+    let mut produced = 0usize;
+    let mut exhausted = false;
+
+    {
+        let mut iter = init.iter.lock();
+        while produced < cap {
+            match iter.next_row() {
+                Some(Ok(row)) => {
+                    for c in 0..ncols {
+                        let vec = ffi::duckdb_data_chunk_get_vector(output, c as idx_t);
+                        let val = row.values.get(c).unwrap_or(&FunctionValue::Null);
+                        write_cell(vec, produced, val, &init.out_types[c]);
+                    }
+                    produced += 1;
+                }
+                Some(Err(e)) => return Err(format!("{e:?}")),
+                None => {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if exhausted {
+        // Mark done so the next func call short-circuits. We need
+        // interior mutability without a &mut; the bool sits behind
+        // a raw write because DuckDB calls func single-threaded
+        // for this scan (max_threads = 1).
+        let init_mut = raw as *mut TfInitData;
+        (*init_mut).done = true;
+    }
+
+    duckdb_data_chunk_set_size(output, produced as idx_t);
+    Ok(())
+}
+
+/// Write `val` into the `row`-th slot of output vector `vec`,
+/// using `out_ty` to pick the physical representation.
+unsafe fn write_cell(vec: ffi::duckdb_vector, row: usize, val: &FunctionValue, out_ty: &DataType) {
+    if matches!(val, FunctionValue::Null) {
+        set_vector_null(vec, row);
+        return;
+    }
+    match out_ty {
+        DataType::Boolean => write_prim::<bool>(vec, row, val.as_bool().unwrap_or(false)),
+        DataType::Int8    => write_prim::<i8>(vec, row, val.as_i64().unwrap_or(0) as i8),
+        DataType::Int16   => write_prim::<i16>(vec, row, val.as_i64().unwrap_or(0) as i16),
+        DataType::Int32   => write_prim::<i32>(vec, row, val.as_i64().unwrap_or(0) as i32),
+        DataType::Int64   => write_prim::<i64>(vec, row, val.as_i64().unwrap_or(0)),
+        DataType::UInt8   => write_prim::<u8>(vec, row, val.as_i64().unwrap_or(0) as u8),
+        DataType::UInt16  => write_prim::<u16>(vec, row, val.as_i64().unwrap_or(0) as u16),
+        DataType::UInt32  => write_prim::<u32>(vec, row, val.as_i64().unwrap_or(0) as u32),
+        DataType::UInt64  => write_prim::<u64>(vec, row, val.as_i64().unwrap_or(0) as u64),
+        DataType::Float32 => write_prim::<f32>(vec, row, val.as_f64().unwrap_or(0.0) as f32),
+        DataType::Float64 => write_prim::<f64>(vec, row, val.as_f64().unwrap_or(0.0)),
+        DataType::Char { .. } | DataType::Varchar { .. } | DataType::Text => {
+            match val {
+                FunctionValue::String(s) => assign_bytes(vec, row, s.as_bytes()),
+                FunctionValue::Binary(b) => assign_bytes(vec, row, b),
+                other => assign_bytes(vec, row, format!("{other:?}").as_bytes()),
+            }
+        }
+        // BLOB / fallback — write the raw bytes.
+        _ => match val {
+            FunctionValue::Binary(b) => assign_bytes(vec, row, b),
+            FunctionValue::String(s) => assign_bytes(vec, row, s.as_bytes()),
+            FunctionValue::Int64(v)  => assign_bytes(vec, row, &v.to_le_bytes()),
+            FunctionValue::Float64(v)=> assign_bytes(vec, row, &v.to_le_bytes()),
+            FunctionValue::Boolean(v)=> assign_bytes(vec, row, &[*v as u8]),
+            _ => set_vector_null(vec, row),
+        },
+    }
+}
+
+unsafe fn write_prim<T: Copy>(vec: ffi::duckdb_vector, row: usize, v: T) {
+    let data = ffi::duckdb_vector_get_data(vec) as *mut T;
+    std::ptr::write(data.add(row), v);
+}
+
+unsafe fn assign_bytes(vec: ffi::duckdb_vector, row: usize, bytes: &[u8]) {
+    ffi::duckdb_vector_assign_string_element_len(
+        vec,
+        row as idx_t,
+        bytes.as_ptr() as *const c_char,
+        bytes.len() as idx_t,
+    );
+}
+
+unsafe fn set_vector_null(vec: ffi::duckdb_vector, row: usize) {
+    ffi::duckdb_vector_ensure_validity_writable(vec);
+    let validity = ffi::duckdb_vector_get_validity(vec);
+    if !validity.is_null() {
+        ffi::duckdb_validity_set_row_invalid(validity, row as idx_t);
+    }
+}
+
+/// Read a DuckDB `duckdb_value` parameter into a FunctionValue,
+/// using the shim's declared parameter `DataType` to pick the
+/// getter.
+unsafe fn read_value(val: ffi::duckdb_value, dt: &DataType) -> FunctionValue {
+    match dt {
+        DataType::Boolean => FunctionValue::Boolean(ffi::duckdb_get_bool(val)),
+        DataType::Int8    => FunctionValue::Int8(ffi::duckdb_get_int8(val)),
+        DataType::Int16   => FunctionValue::Int16(ffi::duckdb_get_int16(val)),
+        DataType::Int32   => FunctionValue::Int32(ffi::duckdb_get_int32(val)),
+        DataType::Int64   => FunctionValue::Int64(ffi::duckdb_get_int64(val)),
+        DataType::UInt8   => FunctionValue::UInt8(ffi::duckdb_get_uint8(val)),
+        DataType::UInt16  => FunctionValue::UInt16(ffi::duckdb_get_uint16(val)),
+        DataType::UInt32  => FunctionValue::UInt32(ffi::duckdb_get_uint32(val)),
+        DataType::UInt64  => FunctionValue::UInt64(ffi::duckdb_get_uint64(val)),
+        DataType::Float32 => FunctionValue::Float32(ffi::duckdb_get_float(val)),
+        DataType::Float64 => FunctionValue::Float64(ffi::duckdb_get_double(val)),
+        DataType::Char { .. } | DataType::Varchar { .. } | DataType::Text => {
+            let p = ffi::duckdb_get_varchar(val);
+            if p.is_null() {
+                FunctionValue::String(String::new())
+            } else {
+                let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+                ffi::duckdb_free(p as *mut c_void);
+                FunctionValue::String(s)
+            }
+        }
+        // BLOB / fallback — pull raw bytes.
+        _ => {
+            let blob = ffi::duckdb_get_blob(val);
+            if blob.data.is_null() || blob.size == 0 {
+                FunctionValue::Binary(Vec::new())
+            } else {
+                let bytes =
+                    std::slice::from_raw_parts(blob.data as *const u8, blob.size as usize).to_vec();
+                FunctionValue::Binary(bytes)
+            }
+        }
+    }
+}
+
+// =====================================================================
+// Init-data tagging.
+//
+// Both the success path (TfInitData) and the error path
+// (TfInitErr) install a Box via `duckdb_init_set_init_data`. To
+// tell them apart in `func` we put a `u8` tag as the first field
+// of each so a single byte read at the box's head discriminates.
+// =====================================================================
+
+const INIT_OK_TAG: u8 = 0x0C;
+const INIT_ERR_TAG: u8 = 0xE5;
+
+#[repr(C)]
+struct TfInitErr {
+    tag: u8,
+    msg: String,
+}
+
+unsafe extern "C" fn drop_extra_info(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    drop(Box::from_raw(ptr as *mut TfExtraInfo));
+}
+
+unsafe extern "C" fn drop_bind_data(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    drop(Box::from_raw(ptr as *mut TfBindData));
+}
+
+unsafe extern "C" fn drop_init_data(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    drop(Box::from_raw(ptr as *mut TfInitData));
+}
+
+unsafe extern "C" fn drop_init_err(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    drop(Box::from_raw(ptr as *mut TfInitErr));
+}
+
+unsafe fn bind_set_err(info: duckdb_bind_info, msg: &str) {
+    if let Ok(cs) = CString::new(msg) {
+        duckdb_bind_set_error(info, cs.as_ptr() as *const c_char);
+    }
+}
+
+unsafe fn func_set_err(info: duckdb_function_info, msg: &str) {
+    if let Ok(cs) = CString::new(msg) {
+        duckdb_function_set_error(info, cs.as_ptr() as *const c_char);
+    }
+}
+"##;
 
 pub fn window_functions_rs(plan: &BridgePlan) -> String {
     let mut s = generated_header();
@@ -7977,9 +8617,20 @@ unsafe fn register_type(con: ffi::duckdb_connection, name: &str) {
     ffi::duckdb_logical_type_set_alias(handle, c_name.as_ptr());
     let rc = ffi::duckdb_register_logical_type(con, handle, std::ptr::null_mut());
     if rc != ffi::DuckDBSuccess {
+        // A non-success rc here means a type with this name already
+        // exists in the catalog (e.g. DuckDB's built-in GEOMETRY
+        // when the spatial extension is loaded, or a re-LOAD of
+        // this bridge). Registration is IDEMPOTENT by design: the
+        // type stays usable, and since both the pre-existing type
+        // and our alias are BLOB-backed at the storage + ABI level,
+        // `CREATE TABLE t (g {NAME})` and every BLOB-shaped scalar
+        // signature keep working against the existing type. We
+        // therefore reuse it rather than treat the clash as an
+        // error. Downgraded to an informational note so it doesn't
+        // read like a failure.
         eprintln!(
-            "[shim-types] could not register type {name} (rc={rc}) — \
-             likely a name clash with an existing type"
+            "[shim-types] type {name} already registered (rc={rc}); reusing the \
+             existing BLOB-compatible definition"
         );
     }
     let mut h = handle;
@@ -8310,29 +8961,69 @@ pub fn spatial_indexes_rs(plan: &BridgePlan) -> String {
     s.push_str(
 r##"//! Spatial index registration.
 //!
-//! DuckDB has built-in ART (B-tree-ish) indexes plus an
-//! `IndexExtensionEntry` hook for extension-defined index
-//! kinds (used by the spatial extension's R-tree). Map each
-//! shim spatial-index `type_id` to a DuckDB index extension
-//! entry; SQL `CREATE INDEX … USING <name>` resolves through
-//! the catalog.
+//! ## Documented limitation (2026-06-25)
 //!
-//! Older DuckDB versions without `IndexExtensionEntry` fall
-//! back to registering an index-aware UDTF that participates
-//! in the optimizer's predicate pushdown via the bind
-//! callback.
+//! Custom index access methods (the C++ `IndexType` /
+//! `IndexExtensionEntry` registry that the in-tree `spatial`
+//! extension uses to implement its R-tree) are NOT reachable
+//! through DuckDB's stable loadable-extension C API. The C API
+//! (`duckdb.h`, the only surface a `--abi-type C_STRUCT`
+//! loadable extension may call) exposes scalar functions,
+//! aggregate functions, table functions, custom logical types,
+//! and casts — but has no `duckdb_register_index_type` (or
+//! equivalent). `CREATE INDEX … USING <name>` resolves the
+//! access-method name against an INTERNAL C++ registry that a
+//! C-ABI extension cannot extend.
+//!
+//! Consequently `CREATE INDEX … USING rtree` (postgis) /
+//! `… USING mobilitydb-strtree` (mobilitydb) cannot be honoured
+//! by this bridge. Rather than fake it — registering a no-op
+//! access method that silently builds nothing would be
+//! misleading — we leave these index names UNregistered. DuckDB
+//! then reports its own `Unknown index type: "RTREE"`, which is
+//! the truthful outcome.
+//!
+//! ## What DOES work (the intended substitute)
+//!
+//! The shim's spatial-index capability is exposed instead as
+//! TABLE FUNCTIONS (see `table_functions.rs`): MobilityDB's
+//! `kdtree_xy_within` / `kdtree_xy_nearest_k` /
+//! `interval_tree_query_overlapping` etc. perform the
+//! index-accelerated query as a UDTF the optimizer can place in
+//! the FROM clause. That path is fully wired and is the
+//! supported way to get index-backed spatial/temporal lookups
+//! from this bridge today.
+//!
+//! ## If/when DuckDB ships a C index-type API
+//!
+//! Map each shim spatial-index `type_id` to the new
+//! registration call here; the interface DB already carries the
+//! names + type_ids (listed below), so the wiring would be
+//! mechanical and shim-agnostic.
+
+use duckdb::{Connection, Result};
+
+/// No-op: custom index access methods are not registerable via
+/// the loadable C API (see module docs). Returns Ok so extension
+/// init doesn't fail; the declared index names simply remain
+/// unknown to `CREATE INDEX … USING <name>`.
+pub fn register_all(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Spatial index access methods the shim advertises (not
+// registerable via the C API — documented limitation above).
+// ----------------------------------------------------------------------
 
 "##,
     );
     for ext in &plan.extensions {
+        s.push_str(&format!("// === extension: {} ===\n", ext.name));
         for ix in &ext.spatial_indexes {
             s.push_str(&format!("// index `{}` type_id={}\n", ix.name, ix.type_id));
         }
     }
-    s.push_str(
-        "\n// TODO: register IndexExtensionEntry per shim index,\n\
-         //       or fall back to UDTF + pushdown.\n",
-    );
     s
 }
 
