@@ -264,12 +264,17 @@ pub fn scalars_rs(plan: &BridgePlan) -> String {
 //! ### Scalar/aggregate name clash
 //!
 //! DuckDB's loadable C API forbids a scalar and an aggregate
-//! sharing a name in the same catalog. The aggregate form is the
-//! one users want for the clashing names (st_collect, st_union,
-//! …), so this emit SKIPS any canonical name also published as an
-//! aggregate, leaving the field clear for `aggregates.rs`. The set
-//! is computed from the plan, so a future shim's clashes resolve
-//! automatically.
+//! sharing a name in the same catalog. Rather than drop the
+//! scalar capability entirely, this emit registers the scalar
+//! under a `_scalar`-suffixed name (e.g. `st_extent` aggregate
+//! stays as `st_extent`; the scalar form becomes
+//! `st_extent_scalar`). The suffix lets callers still invoke the
+//! scalar shape explicitly, while the bare name resolves to the
+//! aggregate the way users typically expect at the SQL surface.
+//! The dispatcher still routes through the SHIM's original name
+//! (`sc.canonical_name`), so no registry changes are needed.
+//! The clash set is computed from the plan, so a future shim's
+//! clashes resolve automatically.
 //!
 //! Dispatch goes through `registry::lookup_scalar(name)` ->
 //! `Arc<dyn ScalarFunctionDef>` + `execute` (unchanged); only the
@@ -316,8 +321,12 @@ pub unsafe fn register_all(conn: duckdb_connection) {
 "##,
     );
 
-    // Aggregate wins on a scalar/aggregate name clash (see module
-    // docs). Computed from the plan so it's shim-agnostic.
+    // On a scalar/aggregate name clash the aggregate keeps the
+    // bare name (matches SQL-DDL user expectation) and the scalar
+    // is registered with a `_scalar` suffix so its capability is
+    // still callable. Aliases follow the same rule per-alias, since
+    // an alias can independently collide. Computed from the plan
+    // so it's shim-agnostic.
     let aggregate_names: std::collections::HashSet<&str> = plan
         .extensions
         .iter()
@@ -327,16 +336,10 @@ pub unsafe fn register_all(conn: duckdb_connection) {
     let mut canonical = 0usize;
     let mut alias_count = 0usize;
     let mut overloads = 0usize;
+    let mut suffixed_scalars = 0usize;
+    let mut suffixed_aliases = 0usize;
     for ext in &plan.extensions {
         for sc in &ext.scalars {
-            if aggregate_names.contains(sc.canonical_name.as_str()) {
-                s.push_str(&format!(
-                    "    // scalar `{}` skipped — name also published as an aggregate; \
-                     the aggregate form is registered instead (see aggregates.rs).\n",
-                    sc.canonical_name,
-                ));
-                continue;
-            }
             // Build the &[(&[DataType], DataType)] overload list as
             // a Rust expression. Every overload registers — no shape
             // is dropped.
@@ -357,17 +360,42 @@ pub unsafe fn register_all(conn: duckdb_connection) {
                 sig_exprs.push(format!("(&[], {ret})"));
             }
             let sigs = sig_exprs.join(", ");
+            let shim_name = sc.canonical_name.as_str();
+            let clash_canonical = aggregate_names.contains(shim_name);
+            let sql_canonical = if clash_canonical {
+                format!("{shim_name}_scalar")
+            } else {
+                shim_name.to_string()
+            };
+            if clash_canonical {
+                s.push_str(&format!(
+                    "    // scalar `{shim_name}` renamed to `{sql_canonical}` — \
+                     bare name is taken by the aggregate; the scalar shape stays \
+                     callable via the suffixed form.\n",
+                ));
+                suffixed_scalars += 1;
+            }
             s.push_str(&format!(
-                "    register_scalar(conn, {name:?}, &[{sigs}]);\n",
-                name = sc.canonical_name,
+                "    register_scalar(conn, {sql:?}, {shim:?}, &[{sigs}]);\n",
+                sql = sql_canonical,
+                shim = shim_name,
                 sigs = sigs,
             ));
             for alias in &sc.aliases {
+                let alias_clash = aggregate_names.contains(alias.as_str());
+                let sql_alias = if alias_clash {
+                    format!("{alias}_scalar")
+                } else {
+                    alias.clone()
+                };
+                if alias_clash {
+                    suffixed_aliases += 1;
+                    s.push_str(&format!(
+                        "    // alias `{alias}` renamed to `{sql_alias}` — bare name is taken by the aggregate.\n",
+                    ));
+                }
                 s.push_str(&format!(
-                    "    register_scalar(conn, {alias:?}, &[{sigs}]); // alias of {name}\n",
-                    alias = alias,
-                    name = sc.canonical_name,
-                    sigs = sigs,
+                    "    register_scalar(conn, {sql_alias:?}, {shim_name:?}, &[{sigs}]); // alias of {shim_name}\n",
                 ));
                 alias_count += 1;
             }
@@ -377,7 +405,9 @@ pub unsafe fn register_all(conn: duckdb_connection) {
     s.push_str(&format!(
         "    // Generic dispatch: {canonical} canonical + {alias_count} alias scalars \
          ({overloads} parameter-list overloads), all registered with their REAL \
-         param + return types.\n"
+         param + return types. \
+         Scalar/aggregate co-name suffix: {suffixed_scalars} canonical + \
+         {suffixed_aliases} alias names emitted with `_scalar` suffix.\n"
     ));
     if canonical == 0 {
         s.push_str("    // (no scalars in this interface DB)\n");
@@ -392,18 +422,25 @@ pub unsafe fn register_all(conn: duckdb_connection) {
 /// crate is self-contained.
 const SCALARS_RUNTIME: &str = r##"}
 
-/// Register one scalar (by canonical name or alias) as a function
-/// SET, one entry per parameter-list overload, each driven by the
-/// generic `invoke` dispatcher.
+/// Register one scalar as a function SET, one entry per
+/// parameter-list overload, each driven by the generic `invoke`
+/// dispatcher.
+///
+/// `sql_name` is the name DuckDB catalogs the function under
+/// (may be suffixed `_scalar` if the bare name is also published
+/// as an aggregate — see module docs). `shim_name` is the name
+/// the shim registry knows the definition by. They differ only
+/// for scalar/aggregate co-name clashes.
 unsafe fn register_scalar(
     conn: duckdb_connection,
     sql_name: &str,
+    shim_name: &str,
     overloads: &[(&[DataType], DataType)],
 ) {
-    let def = match registry::lookup_scalar(sql_name) {
+    let def = match registry::lookup_scalar(shim_name) {
         Some(d) => d,
         None => {
-            eprintln!("[shim-scalars] no shim entry for `{sql_name}` — skipping");
+            eprintln!("[shim-scalars] no shim entry for `{shim_name}` (SQL name `{sql_name}`) — skipping");
             return;
         }
     };
